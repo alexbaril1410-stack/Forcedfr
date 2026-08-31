@@ -1,0 +1,12 @@
+services:
+  forcedfr:
+    # Une fois l'image publiée sur ghcr.io, remplace la ligne "build: ."
+    # par "image: ghcr.io/TON-PSEUDO-GITHUB/forcedfr:latest" (voir README).
+    build: .
+    image: forcedfr:latest
+    volumes:
+      # Adapte ces chemins à l'emplacement réel de ta bibliothèque sur ZimaOS
+      - /DATA/movies:/movies
+      - /DATA/tv:/tv
+      - ./suspect_clips:/app/suspect_clips
+    # Pas de "command:" par défaut : on le précise à chaque `docker compose run`
