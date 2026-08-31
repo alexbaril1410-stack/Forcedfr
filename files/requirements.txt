@@ -1,0 +1,8 @@
+# V1.0 - détection MKV : aucune dépendance externe (stdlib + ffprobe)
+
+# V1.2 - analyse audio
+faster-whisper>=1.0.0
+soundfile>=0.12.1
+
+# Tests
+pytest>=8.0.0
