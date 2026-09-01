@@ -23,16 +23,12 @@ QB_HOST = os.getenv(
 QB_USERNAME = os.getenv("QB_USERNAME", "")
 QB_PASSWORD = os.getenv("QB_PASSWORD", "")
 
-POLL_SECONDS = int(
-    os.getenv("POLL_SECONDS", "10")
-)
+# Vérification très fréquente des nouveaux torrents
+POLL_SECONDS = int(os.getenv("POLL_SECONDS", "2"))
 
+# Temps maximum consacré à la recherche d'un MKV analysable
 ANALYSIS_TIMEOUT = int(
     os.getenv("ANALYSIS_TIMEOUT", "900")
-)
-
-MIN_FILE_PROGRESS = float(
-    os.getenv("MIN_FILE_PROGRESS", "0.01")
 )
 
 LOG_LEVEL = os.getenv(
@@ -59,16 +55,13 @@ log = logging.getLogger("forcedfr")
 
 app = FastAPI(
     title="ForcedFR",
-    description=(
-        "Détection automatique des pistes "
-        "de sous-titres français forcés."
-    ),
-    version="1.0.0",
+    description="Détection automatique des pistes françaises forcées.",
+    version="1.1.0",
 )
 
 
 # ============================================================
-# SESSION QBittorrent
+# SESSION qBITTORRENT
 # ============================================================
 
 qb_session = requests.Session()
@@ -78,15 +71,13 @@ qb_session = requests.Session()
 # ÉTAT DE LA SURVEILLANCE
 # ============================================================
 
-# Liste des torrents connus lors du dernier passage.
 previous_torrents: set[str] = set()
 
-# Torrents actuellement en cours d'analyse.
 processing_torrents: set[str] = set()
 
 
 # ============================================================
-# qBittorrent - AUTHENTIFICATION
+# AUTHENTIFICATION qBITTORRENT
 # ============================================================
 
 def qb_login() -> None:
@@ -99,12 +90,11 @@ def qb_login() -> None:
         timeout=10,
     )
 
-    response.raise_for_status()
-
     if response.status_code not in (200, 204):
         raise RuntimeError(
-            "Authentification qBittorrent échouée : "
-            f"HTTP {response.status_code}"
+            f"Authentification qBittorrent échouée : "
+            f"HTTP {response.status_code} "
+            f"{response.text}"
         )
 
     log.info(
@@ -114,7 +104,7 @@ def qb_login() -> None:
 
 
 # ============================================================
-# qBittorrent - REQUÊTES
+# REQUÊTES qBITTORRENT
 # ============================================================
 
 def qb_request(
@@ -133,11 +123,12 @@ def qb_request(
         timeout=15,
     )
 
+    # Session expirée
     if response.status_code == 403:
 
         log.info(
-            "Session qBittorrent expirée. "
-            "Nouvelle authentification."
+            "Session qBittorrent expirée, "
+            "nouvelle authentification."
         )
 
         qb_login()
@@ -155,20 +146,23 @@ def qb_request(
     if not response.text:
         return None
 
-    if "application/json" in response.headers.get(
+    content_type = response.headers.get(
         "content-type",
         "",
-    ):
+    )
+
+    if "application/json" in content_type:
         return response.json()
 
     return response.text
 
 
 # ============================================================
-# qBittorrent - TORRENTS
+# INFORMATIONS TORRENTS
 # ============================================================
 
 def get_torrents() -> list[dict[str, Any]]:
+
     return qb_request(
         "GET",
         "/api/v2/torrents/info",
@@ -223,7 +217,7 @@ def get_piece_states(
 
 
 # ============================================================
-# qBittorrent - ACTIONS
+# ACTIONS qBITTORRENT
 # ============================================================
 
 def toggle_first_last_piece_priority(
@@ -276,7 +270,7 @@ def start_torrent(
 
 
 # ============================================================
-# FICHIERS MKV
+# RECHERCHE DES MKV
 # ============================================================
 
 def find_mkv_files(
@@ -297,6 +291,7 @@ def find_mkv_files(
         if name.lower().endswith(".mkv"):
             mkvs.append(file)
 
+    # Le plus gros MKV en premier
     return sorted(
         mkvs,
         key=lambda item: item.get(
@@ -331,41 +326,36 @@ def resolve_mkv_path(
     )
 
     # --------------------------------------------------------
-    # CAS 1 : content_path est directement un MKV
+    # CAS 1
+    # content_path pointe directement vers le MKV
     # --------------------------------------------------------
 
     if content_path.suffix.lower() == ".mkv":
-
         return content_path
 
     # --------------------------------------------------------
-    # CAS 2 : chemin relatif depuis save_path
+    # CAS 2
+    # save_path + chemin relatif du fichier
     # --------------------------------------------------------
 
-    candidate = (
-        save_path /
-        file_name
-    )
+    candidate = save_path / file_name
 
     if candidate.exists():
-
         return candidate
 
     # --------------------------------------------------------
-    # CAS 3 : content_path + nom du MKV
+    # CAS 3
+    # content_path + nom du MKV
     # --------------------------------------------------------
 
-    candidate = (
-        content_path /
-        file_name.name
-    )
+    candidate = content_path / file_name.name
 
     if candidate.exists():
-
         return candidate
 
     # --------------------------------------------------------
-    # CAS 4 : recherche récursive
+    # CAS 4
+    # Recherche récursive dans le dossier
     # --------------------------------------------------------
 
     if content_path.is_dir():
@@ -383,10 +373,7 @@ def resolve_mkv_path(
     # Dernier recours
     # --------------------------------------------------------
 
-    return (
-        save_path /
-        file_name
-    )
+    return save_path / file_name
 
 
 # ============================================================
@@ -398,16 +385,13 @@ def run_ffprobe(
 ) -> dict[str, Any]:
 
     if not file_path.exists():
-
         raise FileNotFoundError(
             f"Fichier introuvable : {file_path}"
         )
 
     if not file_path.is_file():
-
         raise RuntimeError(
-            f"Le chemin n'est pas un fichier : "
-            f"{file_path}"
+            f"Le chemin n'est pas un fichier : {file_path}"
         )
 
     command = [
@@ -469,7 +453,6 @@ def detect_french_forced(
         if stream.get(
             "codec_type"
         ) != "subtitle":
-
             continue
 
         tags = stream.get(
@@ -540,12 +523,11 @@ def detect_french_forced(
             forced_flag
             or forced_title
         ):
-
             forced_french.append(
                 subtitle
             )
 
-    result = {
+    return {
         "forced_french": bool(
             forced_french
         ),
@@ -553,18 +535,9 @@ def detect_french_forced(
         "forced_tracks": forced_french,
     }
 
-    log.info(
-        "[FORCEDFR] FR Forced : %s",
-        "OUI"
-        if result["forced_french"]
-        else "NON",
-    )
-
-    return result
-
 
 # ============================================================
-# ANALYSE
+# ANALYSE D'UN TORRENT
 # ============================================================
 
 def analyze_torrent(
@@ -584,7 +557,6 @@ def analyze_torrent(
     )
 
     if not mkvs:
-
         raise RuntimeError(
             "Aucun fichier MKV trouvé."
         )
@@ -598,32 +570,15 @@ def analyze_torrent(
             mkv,
         )
 
+        # Le fichier peut ne pas encore exister.
         if not path.exists():
-
             raise FileNotFoundError(
-                f"MKV pas encore disponible : "
-                f"{path}"
+                f"MKV pas encore disponible : {path}"
             )
 
         if not path.is_file():
-
             raise RuntimeError(
-                f"Le chemin du MKV est un dossier : "
-                f"{path}"
-            )
-
-        file_progress = float(
-            mkv.get(
-                "progress",
-                0,
-            )
-        )
-
-        if file_progress < MIN_FILE_PROGRESS:
-
-            raise RuntimeError(
-                "MKV encore trop peu téléchargé "
-                f"({file_progress:.2%})."
+                f"Le chemin du MKV est un dossier : {path}"
             )
 
         probe = run_ffprobe(
@@ -637,38 +592,27 @@ def analyze_torrent(
         results.append(
             {
                 "path": str(path),
-                "size": mkv.get(
-                    "size"
+                "size": mkv.get("size"),
+                "progress": mkv.get(
+                    "progress",
+                    0,
                 ),
-                "progress": file_progress,
                 "detection": detection,
                 "ffprobe": probe,
             }
         )
 
     forced_french = any(
-        result[
-            "detection"
-        ][
-            "forced_french"
-        ]
+        result["detection"]["forced_french"]
         for result in results
     )
 
     return {
         "torrent": {
-            "hash": torrent[
-                "hash"
-            ],
-            "name": torrent[
-                "name"
-            ],
-            "progress": torrent[
-                "progress"
-            ],
-            "content_path": torrent[
-                "content_path"
-            ],
+            "hash": torrent["hash"],
+            "name": torrent["name"],
+            "progress": torrent["progress"],
+            "content_path": torrent["content_path"],
             "f_l_piece_prio": torrent.get(
                 "f_l_piece_prio"
             ),
@@ -679,7 +623,7 @@ def analyze_torrent(
 
 
 # ============================================================
-# PRIORITÉ TEMPORAIRE
+# ANALYSE AVEC PRIORITÉ TEMPORAIRE
 # ============================================================
 
 def analyze_with_temporary_priority(
@@ -701,10 +645,14 @@ def analyze_with_temporary_priority(
 
     try:
 
+        # ----------------------------------------------------
+        # Activation IMMÉDIATE
+        # ----------------------------------------------------
+
         if not initial_priority:
 
             log.info(
-                "[%s] Activation temporaire "
+                "[%s] Activation immédiate "
                 "f_l_piece_prio.",
                 torrent_hash,
             )
@@ -715,19 +663,24 @@ def analyze_with_temporary_priority(
 
             priority_changed = True
 
-        result = analyze_torrent(
+        # ----------------------------------------------------
+        # Analyse
+        # ----------------------------------------------------
+
+        return analyze_torrent(
             torrent_hash
         )
 
-        return result
-
     finally:
+
+        # ----------------------------------------------------
+        # Toujours désactiver après analyse
+        # ----------------------------------------------------
 
         if priority_changed:
 
             log.info(
-                "[%s] Désactivation "
-                "f_l_piece_prio.",
+                "[%s] Désactivation f_l_piece_prio.",
                 torrent_hash,
             )
 
@@ -740,14 +693,14 @@ def analyze_with_temporary_priority(
             except Exception:
 
                 log.exception(
-                    "[%s] Impossible de restaurer "
+                    "[%s] Impossible de désactiver "
                     "f_l_piece_prio.",
                     torrent_hash,
                 )
 
 
 # ============================================================
-# TRAITEMENT D'UN NOUVEAU TORRENT
+# TRAITEMENT NOUVEAU TORRENT
 # ============================================================
 
 def process_new_torrent(
@@ -772,13 +725,40 @@ def process_new_torrent(
 
     started_at = time.time()
 
+    # --------------------------------------------------------
+    # ACTIVER LA PRIORITÉ IMMÉDIATEMENT
+    # --------------------------------------------------------
+
+    priority_enabled = False
+
     try:
 
-        while True:
+        torrent = get_torrent(
+            torrent_hash
+        )
 
-            # ------------------------------------------------
-            # Timeout
-            # ------------------------------------------------
+        if not torrent.get(
+            "f_l_piece_prio",
+            False,
+        ):
+
+            toggle_first_last_piece_priority(
+                torrent_hash
+            )
+
+            priority_enabled = True
+
+            log.info(
+                "[%s] ⚡ Priorité premières/dernières "
+                "pièces activée.",
+                torrent_hash,
+            )
+
+        # ----------------------------------------------------
+        # Boucle d'analyse
+        # ----------------------------------------------------
+
+        while True:
 
             elapsed = (
                 time.time()
@@ -806,55 +786,33 @@ def process_new_torrent(
 
                 return
 
-            # ------------------------------------------------
-            # Vérification du torrent
-            # ------------------------------------------------
-
             try:
 
                 torrent = get_torrent(
                     torrent_hash
                 )
 
-            except Exception:
-
-                log.exception(
-                    "[%s] Impossible de récupérer "
-                    "le torrent.",
+                log.info(
+                    "[%s] %s — %.2f%%",
                     torrent_hash,
-                )
-
-                time.sleep(
-                    POLL_SECONDS
-                )
-
-                continue
-
-            log.info(
-                "[%s] %s — %.2f%%",
-                torrent_hash,
-                torrent.get(
-                    "name",
-                    "",
-                ),
-                float(
                     torrent.get(
-                        "progress",
-                        0,
-                    )
-                ) * 100,
-            )
+                        "name",
+                        "",
+                    ),
+                    float(
+                        torrent.get(
+                            "progress",
+                            0,
+                        )
+                    ) * 100,
+                )
 
-            # ------------------------------------------------
-            # Tentative d'analyse
-            # ------------------------------------------------
+                # ------------------------------------------------
+                # Tentative immédiate de ffprobe
+                # ------------------------------------------------
 
-            try:
-
-                result = (
-                    analyze_with_temporary_priority(
-                        torrent_hash
-                    )
+                result = analyze_torrent(
+                    torrent_hash
                 )
 
                 if result[
@@ -882,22 +840,22 @@ def process_new_torrent(
                     torrent_hash
                 )
 
-                # Discord sera ajouté ici.
+                # Discord sera ajouté ensuite.
+
                 return
 
-            except FileNotFoundError as exc:
+            except FileNotFoundError:
 
                 log.info(
-                    "[%s] MKV pas encore disponible : %s",
+                    "[%s] MKV pas encore disponible. "
+                    "Nouvelle tentative.",
                     torrent_hash,
-                    exc,
                 )
 
             except RuntimeError as exc:
 
                 log.info(
-                    "[%s] Analyse impossible "
-                    "pour le moment : %s",
+                    "[%s] MKV pas encore analysable : %s",
                     torrent_hash,
                     exc,
                 )
@@ -916,11 +874,50 @@ def process_new_torrent(
                     torrent_hash,
                 )
 
+            awaitable_sleep = POLL_SECONDS
+
             time.sleep(
-                POLL_SECONDS
+                awaitable_sleep
             )
 
     finally:
+
+        # --------------------------------------------------------
+        # TOUJOURS désactiver la priorité
+        # --------------------------------------------------------
+
+        if priority_enabled:
+
+            try:
+
+                # Vérification avant toggle pour éviter
+                # de changer un état déjà modifié ailleurs.
+
+                torrent = get_torrent(
+                    torrent_hash
+                )
+
+                if torrent.get(
+                    "f_l_piece_prio",
+                    False,
+                ):
+
+                    toggle_first_last_piece_priority(
+                        torrent_hash
+                    )
+
+                    log.info(
+                        "[%s] 📴 f_l_piece_prio désactivé.",
+                        torrent_hash,
+                    )
+
+            except Exception:
+
+                log.exception(
+                    "[%s] Impossible de désactiver "
+                    "f_l_piece_prio.",
+                    torrent_hash,
+                )
 
         processing_torrents.discard(
             torrent_hash
@@ -937,23 +934,10 @@ def process_new_torrent(
 
 
 # ============================================================
-# SURVEILLANCE AUTOMATIQUE
+# SURVEILLANCE qBITTORRENT
 # ============================================================
 
 async def monitor_qbittorrent() -> None:
-    """
-    Surveille qBittorrent en permanence.
-
-    Le premier passage établit la liste de référence.
-
-    Ensuite, chaque passage compare :
-
-        anciens torrents
-                 VS
-        torrents actuels
-
-    Toute nouvelle empreinte est automatiquement traitée.
-    """
 
     global previous_torrents
 
@@ -964,7 +948,7 @@ async def monitor_qbittorrent() -> None:
     )
 
     # --------------------------------------------------------
-    # Première récupération
+    # Référence initiale
     # --------------------------------------------------------
 
     try:
@@ -993,7 +977,7 @@ async def monitor_qbittorrent() -> None:
         previous_torrents = set()
 
     # --------------------------------------------------------
-    # Boucle de surveillance
+    # Surveillance permanente
     # --------------------------------------------------------
 
     while True:
@@ -1007,10 +991,6 @@ async def monitor_qbittorrent() -> None:
                 for torrent in torrents
                 if torrent.get("hash")
             }
-
-            # ------------------------------------------------
-            # DIFFÉRENCE
-            # ------------------------------------------------
 
             new_torrents = (
                 current_torrents
@@ -1032,10 +1012,6 @@ async def monitor_qbittorrent() -> None:
                             torrent_hash,
                         )
                     )
-
-            # ------------------------------------------------
-            # Nouvelle référence
-            # ------------------------------------------------
 
             previous_torrents = (
                 current_torrents
@@ -1080,17 +1056,17 @@ async def startup() -> None:
             "non configuré."
         )
 
-        return
+    else:
 
-    try:
+        try:
 
-        qb_login()
+            qb_login()
 
-    except Exception:
+        except Exception:
 
-        log.exception(
-            "Connexion initiale qBittorrent échouée."
-        )
+            log.exception(
+                "Connexion initiale qBittorrent échouée."
+            )
 
     asyncio.create_task(
         monitor_qbittorrent()
@@ -1110,7 +1086,7 @@ def health() -> dict[str, Any]:
 
     return {
         "status": "ok",
-        "version": "1.0.0",
+        "version": "1.1.0",
         "qbittorrent": QB_HOST,
         "monitoring": True,
         "poll_seconds": POLL_SECONDS,
@@ -1128,10 +1104,7 @@ def torrents() -> Any:
 
         raise HTTPException(
             status_code=502,
-            detail=(
-                "Erreur qBittorrent : "
-                f"{exc}"
-            ),
+            detail=f"Erreur qBittorrent : {exc}",
         )
 
 
@@ -1163,17 +1136,13 @@ def inspect(
         }
 
     except HTTPException:
-
         raise
 
     except Exception as exc:
 
         raise HTTPException(
             status_code=502,
-            detail=(
-                "Erreur : "
-                f"{exc}"
-            ),
+            detail=f"Erreur : {exc}",
         )
 
 
@@ -1191,7 +1160,6 @@ def analyze(
         )
 
     except HTTPException:
-
         raise
 
     except FileNotFoundError as exc:
@@ -1205,20 +1173,14 @@ def analyze(
 
         raise HTTPException(
             status_code=504,
-            detail=(
-                "ffprobe a dépassé "
-                "60 secondes."
-            ),
+            detail="ffprobe a dépassé 60 secondes.",
         )
 
     except Exception as exc:
 
         raise HTTPException(
             status_code=502,
-            detail=(
-                "Analyse impossible : "
-                f"{exc}"
-            ),
+            detail=f"Analyse impossible : {exc}",
         )
 
 
@@ -1243,10 +1205,7 @@ def pause(
 
         raise HTTPException(
             status_code=502,
-            detail=(
-                "Erreur qBittorrent : "
-                f"{exc}"
-            ),
+            detail=f"Erreur qBittorrent : {exc}",
         )
 
 
@@ -1271,8 +1230,5 @@ def resume(
 
         raise HTTPException(
             status_code=502,
-            detail=(
-                "Erreur qBittorrent : "
-                f"{exc}"
-            ),
+            detail=f"Erreur qBittorrent : {exc}",
         )
