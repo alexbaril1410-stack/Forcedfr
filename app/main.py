@@ -378,6 +378,14 @@ def resolve_mkv_path(
 
 
 # ============================================================
+# ERREUR TEMPORAIRE FFPROBE
+# ============================================================
+
+class IncompleteMKVError(RuntimeError):
+    """Le MKV est encore incomplet et doit être réessayé."""
+
+
+# ============================================================
 # FFPROBE
 # ============================================================
 
@@ -426,6 +434,27 @@ def run_ffprobe(
 
         error = result.stderr.strip()
 
+        # Erreurs normales pendant le téléchargement :
+        # le fichier existe déjà mais son en-tête MKV n'est
+        # pas encore entièrement disponible.
+        temporary_markers = (
+            "EBML header parsing failed",
+            "Invalid data found when processing input",
+            "invalid as first byte of an EBML number",
+            "End of file",
+            "Input/output error",
+        )
+
+        if any(
+            marker.lower() in error.lower()
+            for marker in temporary_markers
+        ):
+            raise IncompleteMKVError(
+                error or "MKV encore incomplet."
+            )
+
+        # Toute autre erreur est considérée comme une
+        # vraie erreur d'analyse.
         raise RuntimeError(
             error or "ffprobe a échoué."
         )
@@ -768,23 +797,15 @@ def process_new_torrent(
 
             if elapsed >= ANALYSIS_TIMEOUT:
 
-                log.warning(
-                    "[%s] Timeout après %ss.",
+                log.error(
+                    "[%s] ⚠️ ERREUR RÉELLE : timeout d'analyse "
+                    "après %ss. Le téléchargement continue.",
                     torrent_hash,
                     ANALYSIS_TIMEOUT,
                 )
 
-                try:
-                    stop_torrent(
-                        torrent_hash
-                    )
-                except Exception:
-                    log.exception(
-                        "[%s] Impossible de mettre "
-                        "le torrent en pause.",
-                        torrent_hash,
-                    )
-
+                # TODO : envoyer la notification Discord.
+                # IMPORTANT : ne pas mettre le torrent en pause.
                 return
 
             try:
@@ -853,27 +874,50 @@ def process_new_torrent(
                     torrent_hash,
                 )
 
-            except RuntimeError as exc:
+            except IncompleteMKVError as exc:
 
                 log.info(
-                    "[%s] MKV pas encore analysable : %s",
+                    "[%s] MKV encore incomplet : %s",
                     torrent_hash,
                     exc,
                 )
 
-            except subprocess.TimeoutExpired:
+            except subprocess.TimeoutExpired as exc:
 
-                log.warning(
-                    "[%s] ffprobe timeout.",
+                log.error(
+                    "[%s] ⚠️ ERREUR RÉELLE : ffprobe timeout. "
+                    "Le téléchargement continue.",
                     torrent_hash,
                 )
 
-            except Exception:
+                # TODO : envoyer la notification Discord.
+                # Le torrent est volontairement laissé en cours.
+                return
+
+            except RuntimeError as exc:
+
+                log.error(
+                    "[%s] ⚠️ ERREUR RÉELLE D'ANALYSE : %s",
+                    torrent_hash,
+                    exc,
+                )
+
+                # TODO : envoyer la notification Discord.
+                # Le torrent est volontairement laissé en cours.
+                return
+
+            except Exception as exc:
 
                 log.exception(
-                    "[%s] Erreur pendant l'analyse.",
+                    "[%s] ⚠️ ERREUR RÉELLE INATTENDUE : %s "
+                    "Le téléchargement continue.",
                     torrent_hash,
+                    exc,
                 )
+
+                # TODO : envoyer la notification Discord.
+                # Le torrent est volontairement laissé en cours.
+                return
 
             time.sleep(ANALYSIS_POLL_SECONDS)
 
