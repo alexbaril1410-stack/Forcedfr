@@ -23,6 +23,8 @@ QB_HOST = os.getenv(
 QB_USERNAME = os.getenv("QB_USERNAME", "")
 QB_PASSWORD = os.getenv("QB_PASSWORD", "")
 
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
+
 # Vérification très fréquente des nouveaux torrents
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "1"))
 ANALYSIS_POLL_SECONDS = 0.5
@@ -57,7 +59,7 @@ log = logging.getLogger("forcedfr")
 app = FastAPI(
     title="ForcedFR",
     description="Détection automatique des pistes françaises forcées.",
-    version="1.1.0",
+    version="1.2.0",
 )
 
 
@@ -267,6 +269,71 @@ def start_torrent(
     log.info(
         "[%s] Torrent relancé.",
         torrent_hash,
+    )
+
+
+# ============================================================
+# DISCORD
+# ============================================================
+
+def send_discord_message(
+    message: str,
+) -> None:
+
+    if not DISCORD_WEBHOOK_URL:
+        log.warning(
+            "Webhook Discord non configuré : notification ignorée."
+        )
+        return
+
+    try:
+        response = requests.post(
+            DISCORD_WEBHOOK_URL,
+            json={"content": message},
+            timeout=10,
+        )
+
+        response.raise_for_status()
+
+        log.info("Notification Discord envoyée.")
+
+    except Exception:
+        log.exception(
+            "Impossible d'envoyer la notification Discord."
+        )
+
+
+def notify_no_french_forced(
+    torrent: dict[str, Any],
+) -> None:
+
+    name = torrent.get("name", "Nom inconnu")
+    progress = float(torrent.get("progress", 0)) * 100
+
+    send_discord_message(
+        "🚨 **ForcedFR — aucune piste FR Forced détectée**\n"
+        f"**Torrent :** {name}\n"
+        f"**Progression :** {progress:.2f}%\n"
+        f"**Action :** téléchargement mis en pause.\n"
+        "Vérification manuelle recommandée si nécessaire."
+    )
+
+
+def notify_analysis_error(
+    torrent: dict[str, Any],
+    error: str,
+) -> None:
+
+    name = torrent.get("name", "Nom inconnu")
+    progress = float(torrent.get("progress", 0)) * 100
+
+    send_discord_message(
+        "⚠️ **ForcedFR — erreur d'analyse**\n"
+        f"**Torrent :** {name}\n"
+        f"**Progression :** {progress:.2f}%\n"
+        f"**Erreur :** {error}\n"
+        "**Action :** téléchargement laissé en cours.\n"
+        "👉 Vérification manuelle nécessaire."
     )
 
 
@@ -804,7 +871,11 @@ def process_new_torrent(
                     ANALYSIS_TIMEOUT,
                 )
 
-                # TODO : envoyer la notification Discord.
+                notify_analysis_error(
+                    torrent,
+                    f"Timeout après {ANALYSIS_TIMEOUT} secondes.",
+                )
+
                 # IMPORTANT : ne pas mettre le torrent en pause.
                 return
 
@@ -862,7 +933,9 @@ def process_new_torrent(
                     torrent_hash
                 )
 
-                # Discord sera ajouté ensuite.
+                notify_no_french_forced(
+                    torrent
+                )
 
                 return
 
@@ -890,7 +963,11 @@ def process_new_torrent(
                     torrent_hash,
                 )
 
-                # TODO : envoyer la notification Discord.
+                notify_analysis_error(
+                    torrent,
+                    "ffprobe a dépassé son délai de 60 secondes.",
+                )
+
                 # Le torrent est volontairement laissé en cours.
                 return
 
@@ -902,7 +979,11 @@ def process_new_torrent(
                     exc,
                 )
 
-                # TODO : envoyer la notification Discord.
+                notify_analysis_error(
+                    torrent,
+                    str(exc),
+                )
+
                 # Le torrent est volontairement laissé en cours.
                 return
 
@@ -915,7 +996,11 @@ def process_new_torrent(
                     exc,
                 )
 
-                # TODO : envoyer la notification Discord.
+                notify_analysis_error(
+                    torrent,
+                    str(exc),
+                )
+
                 # Le torrent est volontairement laissé en cours.
                 return
 
@@ -1127,7 +1212,7 @@ def health() -> dict[str, Any]:
 
     return {
         "status": "ok",
-        "version": "1.1.0",
+        "version": "1.2.0",
         "qbittorrent": QB_HOST,
         "monitoring": True,
         "poll_seconds": POLL_SECONDS,
