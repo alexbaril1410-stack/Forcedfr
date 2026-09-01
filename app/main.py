@@ -24,7 +24,8 @@ QB_USERNAME = os.getenv("QB_USERNAME", "")
 QB_PASSWORD = os.getenv("QB_PASSWORD", "")
 
 # Vérification très fréquente des nouveaux torrents
-POLL_SECONDS = int(os.getenv("POLL_SECONDS", "2"))
+POLL_SECONDS = int(os.getenv("POLL_SECONDS", "1"))
+ANALYSIS_POLL_SECONDS = 0.5
 
 # Temps maximum consacré à la recherche d'un MKV analysable
 ANALYSIS_TIMEOUT = int(
@@ -874,11 +875,7 @@ def process_new_torrent(
                     torrent_hash,
                 )
 
-            awaitable_sleep = POLL_SECONDS
-
-            time.sleep(
-                awaitable_sleep
-            )
+            time.sleep(ANALYSIS_POLL_SECONDS)
 
     finally:
 
