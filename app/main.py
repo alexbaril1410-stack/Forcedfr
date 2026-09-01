@@ -1,299 +1,174 @@
+import json
 import os
+import subprocess
+from pathlib import Path
 from typing import Any
 
 import requests
 from fastapi import FastAPI, HTTPException
 
-QB_HOST = os.getenv("QB_HOST", "").rstrip("/")
+QB_HOST = os.getenv("QB_HOST", "http://192.168.1.42:8080").rstrip("/")
 QB_USERNAME = os.getenv("QB_USERNAME", "")
 QB_PASSWORD = os.getenv("QB_PASSWORD", "")
 
-app = FastAPI(
-    title="ForcedFR",
-    description="Détection précoce des pistes de sous-titres français forcés.",
-    version="0.1.0",
-)
-
+app = FastAPI(title="ForcedFR", version="0.1.1")
 session = requests.Session()
 
 
 def qb_login() -> None:
-    """Authentifie la session auprès de qBittorrent."""
-
-    response = session.post(
+    r = session.post(
         f"{QB_HOST}/api/v2/auth/login",
-        data={
-            "username": QB_USERNAME,
-            "password": QB_PASSWORD,
-        },
+        data={"username": QB_USERNAME, "password": QB_PASSWORD},
         timeout=10,
     )
-
-    response.raise_for_status()
-
-    if response.text.strip() != "Ok.":
-        raise RuntimeError(
-            f"Échec de connexion à qBittorrent: {response.text}"
-        )
+    r.raise_for_status()
+    if r.text.strip() != "Ok.":
+        raise RuntimeError(f"Échec connexion qBittorrent: {r.text}")
 
 
-def qb_request(
-    method: str,
-    endpoint: str,
-    params: dict[str, Any] | None = None,
-    data: dict[str, Any] | None = None,
-) -> Any:
-    """Effectue une requête vers l'API qBittorrent."""
-
-    url = f"{QB_HOST}{endpoint}"
-
-    response = session.request(
-        method,
-        url,
-        params=params,
-        data=data,
-        timeout=15,
+def qb_request(method: str, endpoint: str, params=None, data=None) -> Any:
+    r = session.request(
+        method, f"{QB_HOST}{endpoint}",
+        params=params, data=data, timeout=15
     )
-
-    # Session expirée : nouvelle authentification puis nouvelle tentative.
-    if response.status_code == 403:
+    if r.status_code == 403:
         qb_login()
-
-        response = session.request(
-            method,
-            url,
-            params=params,
-            data=data,
-            timeout=15,
+        r = session.request(
+            method, f"{QB_HOST}{endpoint}",
+            params=params, data=data, timeout=15
         )
-
-    response.raise_for_status()
-
-    if not response.text:
+    r.raise_for_status()
+    if not r.text:
         return None
-
-    content_type = response.headers.get("content-type", "")
-
-    if "application/json" in content_type:
-        return response.json()
-
-    return response.text
+    return r.json() if "application/json" in r.headers.get("content-type", "") else r.text
 
 
-@app.on_event("startup")
-def startup() -> None:
-    """Teste la connexion à qBittorrent au démarrage."""
-
-    if not QB_USERNAME or not QB_PASSWORD:
-        print(
-            "WARNING: QB_USERNAME ou QB_PASSWORD n'est pas configuré."
-        )
-        return
-
-    try:
-        qb_login()
-        print(f"Connexion qBittorrent réussie : {QB_HOST}")
-    except Exception as exc:
-        print(f"WARNING: impossible de se connecter à qBittorrent : {exc}")
+def torrent_context(h: str):
+    torrents = qb_request("GET", "/api/v2/torrents/info", {"hashes": h})
+    if not torrents:
+        raise HTTPException(404, "Torrent introuvable.")
+    files = qb_request("GET", "/api/v2/torrents/files", {"hash": h})
+    return torrents[0], files
 
 
-@app.get("/health")
-def health() -> dict[str, Any]:
-    """Vérifie que ForcedFR fonctionne."""
+def find_mkv(files):
+    mkvs = [f for f in files if str(f.get("name", "")).lower().endswith(".mkv")]
+    if not mkvs:
+        raise RuntimeError("Aucun fichier MKV trouvé.")
+    return max(mkvs, key=lambda f: f.get("size", 0))
 
+
+def run_ffprobe(path: str):
+    if not Path(path).exists():
+        raise FileNotFoundError(path)
+
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-show_entries",
+        "stream=index,codec_type:stream_tags=language,title",
+        "-of", "json", path,
+    ]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    if r.returncode != 0:
+        raise RuntimeError(r.stderr.strip() or "ffprobe a échoué")
+    return json.loads(r.stdout or '{"streams":[]}')
+
+
+def detect_french_forced(probe):
+    subtitles = []
+    for s in probe.get("streams", []):
+        if s.get("codec_type") != "subtitle":
+            continue
+        tags = s.get("tags") or {}
+        language = str(tags.get("language", "")).lower()
+        title = str(tags.get("title", "")).lower()
+        french = language in {"fr", "fra", "fre", "fra-fr", "fre-fr"}
+        forced_title = "forced" in title or "forcé" in title
+        subtitles.append({
+            "index": s.get("index"),
+            "language": language or None,
+            "title": tags.get("title"),
+            "french": french,
+            "forced_by_title": forced_title,
+        })
     return {
-        "status": "ok",
-        "version": "0.1.0",
-        "qbittorrent": QB_HOST,
+        "forced_french": any(x["french"] and x["forced_by_title"] for x in subtitles),
+        "subtitles": subtitles,
+        "confidence": "metadata-title-only",
     }
 
 
+@app.get("/health")
+def health():
+    return {"status": "ok", "version": "0.1.1", "qBittorrent": QB_HOST}
+
+
 @app.get("/torrents")
-def get_torrents() -> Any:
-    """Retourne les torrents actuellement présents dans qBittorrent."""
-
+def torrents():
     try:
-        return qb_request(
-            "GET",
-            "/api/v2/torrents/info",
-        )
-
-    except Exception as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Erreur qBittorrent : {exc}",
-        )
+        qb_login()
+        return qb_request("GET", "/api/v2/torrents/info")
+    except Exception as e:
+        raise HTTPException(502, f"Erreur qBittorrent : {e}")
 
 
-@app.get("/torrent/{torrent_hash}")
-def get_torrent(torrent_hash: str) -> Any:
-    """Retourne les informations d'un torrent."""
-
+@app.get("/torrent/{h}/inspect")
+def inspect(h: str):
     try:
-        torrents = qb_request(
-            "GET",
-            "/api/v2/torrents/info",
-            params={
-                "hashes": torrent_hash,
-            },
-        )
-
-        if not torrents:
-            raise HTTPException(
-                status_code=404,
-                detail="Torrent introuvable.",
-            )
-
-        return torrents[0]
-
+        qb_login()
+        torrent, files = torrent_context(h)
+        states = qb_request("GET", "/api/v2/torrents/pieceStates", {"hash": h})
+        return {"torrent": torrent, "files": files, "piece_states": states}
     except HTTPException:
         raise
-
-    except Exception as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Erreur qBittorrent : {exc}",
-        )
+    except Exception as e:
+        raise HTTPException(502, f"Erreur : {e}")
 
 
-@app.get("/torrent/{torrent_hash}/files")
-def get_torrent_files(torrent_hash: str) -> Any:
-    """Retourne les fichiers contenus dans un torrent."""
-
+@app.get("/torrent/{h}/analyze")
+def analyze(h: str):
     try:
-        return qb_request(
-            "GET",
-            "/api/v2/torrents/files",
-            params={
-                "hash": torrent_hash,
-            },
-        )
-
-    except Exception as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Erreur qBittorrent : {exc}",
-        )
-
-
-@app.get("/torrent/{torrent_hash}/pieces")
-def get_piece_states(torrent_hash: str) -> Any:
-    """Retourne l'état de chaque pièce du torrent."""
-
-    try:
-        return qb_request(
-            "GET",
-            "/api/v2/torrents/pieceStates",
-            params={
-                "hash": torrent_hash,
-            },
-        )
-
-    except Exception as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Erreur qBittorrent : {exc}",
-        )
-
-
-@app.get("/torrent/{torrent_hash}/inspect")
-def inspect_torrent(torrent_hash: str) -> dict[str, Any]:
-    """
-    Retourne toutes les informations nécessaires à notre phase de test.
-
-    Aucun changement n'est effectué sur le torrent.
-    """
-
-    try:
-        torrent = qb_request(
-            "GET",
-            "/api/v2/torrents/info",
-            params={
-                "hashes": torrent_hash,
-            },
-        )
-
-        if not torrent:
-            raise HTTPException(
-                status_code=404,
-                detail="Torrent introuvable.",
-            )
-
-        files = qb_request(
-            "GET",
-            "/api/v2/torrents/files",
-            params={
-                "hash": torrent_hash,
-            },
-        )
-
-        piece_states = qb_request(
-            "GET",
-            "/api/v2/torrents/pieceStates",
-            params={
-                "hash": torrent_hash,
-            },
-        )
-
+        qb_login()
+        torrent, files = torrent_context(h)
+        mkv = find_mkv(files)
+        probe = run_ffprobe(mkv["name"])
+        detection = detect_french_forced(probe)
         return {
-            "torrent": torrent[0],
-            "files": files,
-            "piece_states": piece_states,
+            "torrent": {
+                "hash": torrent["hash"],
+                "name": torrent["name"],
+                "progress": torrent["progress"],
+                "content_path": torrent["content_path"],
+            },
+            "file": {"path": mkv["name"], "size": mkv.get("size")},
+            "detection": detection,
+            "ffprobe": probe,
         }
-
     except HTTPException:
         raise
+    except FileNotFoundError as e:
+        raise HTTPException(404, f"Fichier inaccessible depuis ForcedFR : {e}")
+    except subprocess.TimeoutExpired:
+        raise HTTPException(504, "ffprobe a dépassé 60 secondes.")
+    except Exception as e:
+        raise HTTPException(502, f"Analyse impossible : {e}")
 
-    except Exception as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Erreur qBittorrent : {exc}",
-        )
 
-
-@app.post("/torrent/{torrent_hash}/pause")
-def pause_torrent(torrent_hash: str) -> dict[str, bool]:
-    """
-    Met un torrent en pause.
-
-    Endpoint de test : il sera utilisé plus tard par le moteur de décision.
-    """
-
+@app.post("/torrent/{h}/pause")
+def pause(h: str):
     try:
-        qb_request(
-            "POST",
-            "/api/v2/torrents/stop",
-            data={
-                "hashes": torrent_hash,
-            },
-        )
-
+        qb_login()
+        qb_request("POST", "/api/v2/torrents/stop", data={"hashes": h})
         return {"ok": True}
-
-    except Exception as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Erreur qBittorrent : {exc}",
-        )
+    except Exception as e:
+        raise HTTPException(502, f"Erreur qBittorrent : {e}")
 
 
-@app.post("/torrent/{torrent_hash}/resume")
-def resume_torrent(torrent_hash: str) -> dict[str, bool]:
-    """Reprend un torrent."""
-
+@app.post("/torrent/{h}/resume")
+def resume(h: str):
     try:
-        qb_request(
-            "POST",
-            "/api/v2/torrents/start",
-            data={
-                "hashes": torrent_hash,
-            },
-        )
-
+        qb_login()
+        qb_request("POST", "/api/v2/torrents/start", data={"hashes": h})
         return {"ok": True}
-
-    except Exception as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Erreur qBittorrent : {exc}",
-        )
+    except Exception as e:
+        raise HTTPException(502, f"Erreur qBittorrent : {e}")
