@@ -25,6 +25,12 @@ QB_PASSWORD = os.getenv("QB_PASSWORD", "")
 
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 
+RADARR_URL = os.getenv("RADARR_URL", "http://192.168.1.42:7878").rstrip("/")
+RADARR_API_KEY = os.getenv("RADARR_API_KEY", "").strip()
+
+SONARR_URL = os.getenv("SONARR_URL", "http://192.168.1.42:8989").rstrip("/")
+SONARR_API_KEY = os.getenv("SONARR_API_KEY", "").strip()
+
 # Vérification très fréquente des nouveaux torrents
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "1"))
 ANALYSIS_POLL_SECONDS = 0.5
@@ -59,7 +65,7 @@ log = logging.getLogger("forcedfr")
 app = FastAPI(
     title="ForcedFR",
     description="Détection automatique des pistes françaises forcées.",
-    version="1.2.0",
+    version="1.3.0",
 )
 
 
@@ -273,11 +279,120 @@ def start_torrent(
 
 
 # ============================================================
-# DISCORD
+# DISCORD / RADARR / SONARR
 # ============================================================
 
+def arr_history_lookup(
+    base_url: str,
+    api_key: str,
+    torrent_hash: str,
+    source: str,
+) -> dict[str, Any] | None:
+
+    if not base_url or not api_key:
+        return None
+
+    try:
+
+        response = requests.get(
+            f"{base_url}/api/v3/history",
+            headers={"X-Api-Key": api_key},
+            params={"pageSize": 1000},
+            timeout=10,
+        )
+
+        response.raise_for_status()
+
+        records = response.json().get("records", [])
+
+        matches = [
+            item
+            for item in records
+            if str(item.get("downloadId", "")).lower()
+            == torrent_hash.lower()
+        ]
+
+        if not matches:
+            return None
+
+        grabbed = next(
+            (
+                item
+                for item in matches
+                if item.get("eventType") == "grabbed"
+            ),
+            matches[0],
+        )
+
+        data = grabbed.get("data", {}) or {}
+
+        return {
+            "source": source,
+            "title": grabbed.get("sourceTitle"),
+            "indexer": data.get("indexer"),
+            "tracker_url": (
+                data.get("nzbInfoUrl")
+                or data.get("infoUrl")
+            ),
+            "event_type": grabbed.get("eventType"),
+        }
+
+    except Exception as exc:
+
+        log.warning(
+            "[%s] Impossible de récupérer l'historique %s : %s",
+            torrent_hash,
+            source,
+            exc,
+        )
+
+        return None
+
+
+def get_release_context(
+    torrent_hash: str,
+) -> dict[str, Any]:
+
+    radarr = arr_history_lookup(
+        RADARR_URL,
+        RADARR_API_KEY,
+        torrent_hash,
+        "Radarr",
+    )
+
+    if radarr:
+        return radarr
+
+    sonarr = arr_history_lookup(
+        SONARR_URL,
+        SONARR_API_KEY,
+        torrent_hash,
+        "Sonarr",
+    )
+
+    if sonarr:
+        return sonarr
+
+    return {
+        "source": None,
+        "title": None,
+        "indexer": None,
+        "tracker_url": None,
+        "event_type": None,
+    }
+
+
+def build_qbittorrent_url(
+    torrent_hash: str,
+) -> str:
+
+    return f"{QB_HOST}/#torrent={torrent_hash}"
+
+
 def send_discord_message(
-    message: str,
+    *,
+    embeds: list[dict[str, Any]],
+    components: list[dict[str, Any]] | None = None,
 ) -> None:
 
     if not DISCORD_WEBHOOK_URL:
@@ -286,36 +401,177 @@ def send_discord_message(
         )
         return
 
+    payload: dict[str, Any] = {
+        "username": "ForcedFR",
+        "embeds": embeds,
+    }
+
+    if components:
+        payload["components"] = components
+
     try:
+
         response = requests.post(
             DISCORD_WEBHOOK_URL,
-            json={"content": message},
+            json=payload,
             timeout=10,
         )
 
         response.raise_for_status()
 
-        log.info("Notification Discord envoyée.")
+        log.info(
+            "Notification Discord envoyée."
+        )
 
     except Exception:
+
         log.exception(
             "Impossible d'envoyer la notification Discord."
         )
+
+
+def build_discord_components(
+    torrent_hash: str,
+    tracker_url: str | None,
+) -> list[dict[str, Any]]:
+
+    buttons = []
+
+    if tracker_url:
+
+        buttons.append(
+            {
+                "type": 2,
+                "style": 5,
+                "label": "Voir le torrent",
+                "url": tracker_url,
+            }
+        )
+
+    buttons.append(
+        {
+            "type": 2,
+            "style": 5,
+            "label": "Ouvrir qBittorrent",
+            "url": build_qbittorrent_url(
+                torrent_hash
+            ),
+        }
+    )
+
+    return [
+        {
+            "type": 1,
+            "components": buttons,
+        }
+    ]
+
+
+def build_release_fields(
+    torrent: dict[str, Any],
+    release: dict[str, Any],
+) -> list[dict[str, Any]]:
+
+    fields = [
+        {
+            "name": "Torrent",
+            "value": (
+                f"`{torrent.get('name', 'Nom inconnu')}`"
+            )[:1024],
+            "inline": False,
+        },
+        {
+            "name": "Progression",
+            "value": (
+                f"{float(torrent.get('progress', 0)) * 100:.2f}%"
+            ),
+            "inline": True,
+        },
+    ]
+
+    if release.get("source"):
+
+        fields.append(
+            {
+                "name": "Source",
+                "value": release["source"],
+                "inline": True,
+            }
+        )
+
+    if release.get("indexer"):
+
+        fields.append(
+            {
+                "name": "Indexeur",
+                "value": str(
+                    release["indexer"]
+                )[:1024],
+                "inline": True,
+            }
+        )
+
+    return fields
 
 
 def notify_no_french_forced(
     torrent: dict[str, Any],
 ) -> None:
 
-    name = torrent.get("name", "Nom inconnu")
-    progress = float(torrent.get("progress", 0)) * 100
+    torrent_hash = str(
+        torrent.get("hash", "")
+    )
+
+    release = get_release_context(
+        torrent_hash
+    )
+
+    fields = build_release_fields(
+        torrent,
+        release,
+    )
+
+    fields.extend(
+        [
+            {
+                "name": "Action effectuée",
+                "value": (
+                    "⏸️ Le téléchargement a été mis en pause automatiquement."
+                ),
+                "inline": False,
+            },
+            {
+                "name": "Que faire ?",
+                "value": (
+                    "Vérifie le torrent puis décide dans qBittorrent "
+                    "si tu souhaites reprendre ou supprimer le téléchargement."
+                ),
+                "inline": False,
+            },
+        ]
+    )
 
     send_discord_message(
-        "🚨 **ForcedFR — aucune piste FR Forced détectée**\n"
-        f"**Torrent :** {name}\n"
-        f"**Progression :** {progress:.2f}%\n"
-        f"**Action :** téléchargement mis en pause.\n"
-        "Vérification manuelle recommandée si nécessaire."
+        embeds=[
+            {
+                "title": "🚨 Aucune piste FR Forced détectée",
+                "description": (
+                    "ForcedFR a pu analyser le fichier, mais aucune piste "
+                    "de sous-titres français forcés n'a été trouvée."
+                ),
+                "color": 15158332,
+                "fields": fields,
+                "footer": {
+                    "text": (
+                        "ForcedFR • Vérification manuelle recommandée"
+                    ),
+                },
+            }
+        ],
+        components=build_discord_components(
+            torrent_hash,
+            release.get("tracker_url"),
+        ),
     )
 
 
@@ -324,16 +580,69 @@ def notify_analysis_error(
     error: str,
 ) -> None:
 
-    name = torrent.get("name", "Nom inconnu")
-    progress = float(torrent.get("progress", 0)) * 100
+    torrent_hash = str(
+        torrent.get("hash", "")
+    )
+
+    release = get_release_context(
+        torrent_hash
+    )
+
+    fields = build_release_fields(
+        torrent,
+        release,
+    )
+
+    error_text = str(
+        error
+    ).strip() or "Erreur inconnue"
+
+    fields.extend(
+        [
+            {
+                "name": "Erreur d'analyse",
+                "value": f"```{error_text[:1000]}```",
+                "inline": False,
+            },
+            {
+                "name": "Action effectuée",
+                "value": (
+                    "▶️ Le téléchargement continue automatiquement."
+                ),
+                "inline": False,
+            },
+            {
+                "name": "Que faire ?",
+                "value": (
+                    "ForcedFR n'a pas pu déterminer le résultat de manière fiable. "
+                    "Une vérification manuelle est recommandée."
+                ),
+                "inline": False,
+            },
+        ]
+    )
 
     send_discord_message(
-        "⚠️ **ForcedFR — erreur d'analyse**\n"
-        f"**Torrent :** {name}\n"
-        f"**Progression :** {progress:.2f}%\n"
-        f"**Erreur :** {error}\n"
-        "**Action :** téléchargement laissé en cours.\n"
-        "👉 Vérification manuelle nécessaire."
+        embeds=[
+            {
+                "title": "⚠️ Erreur pendant l'analyse ForcedFR",
+                "description": (
+                    "Le torrent n'a pas été bloqué afin d'éviter "
+                    "une interruption injustifiée du téléchargement."
+                ),
+                "color": 16776960,
+                "fields": fields,
+                "footer": {
+                    "text": (
+                        "ForcedFR • Téléchargement laissé en cours"
+                    ),
+                },
+            }
+        ],
+        components=build_discord_components(
+            torrent_hash,
+            release.get("tracker_url"),
+        ),
     )
 
 
@@ -1212,7 +1521,7 @@ def health() -> dict[str, Any]:
 
     return {
         "status": "ok",
-        "version": "1.2.0",
+        "version": "1.3.0",
         "qbittorrent": QB_HOST,
         "monitoring": True,
         "poll_seconds": POLL_SECONDS,
