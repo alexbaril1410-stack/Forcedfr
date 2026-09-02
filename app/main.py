@@ -45,6 +45,11 @@ LOG_LEVEL = os.getenv(
     "INFO",
 ).upper()
 
+# Recherche du contexte Radarr/Sonarr avant notification Discord
+# 1 tentative toutes les 5 secondes pendant 1 minute maximum.
+RELEASE_CONTEXT_RETRY_SECONDS = 5
+RELEASE_CONTEXT_TIMEOUT = 60
+
 
 # ============================================================
 # LOGGING
@@ -65,7 +70,7 @@ log = logging.getLogger("forcedfr")
 app = FastAPI(
     title="ForcedFR",
     description="Détection automatique des pistes françaises forcées.",
-    version="1.3.0",
+    version="1.3.1",
 )
 
 
@@ -382,6 +387,67 @@ def get_release_context(
     }
 
 
+def wait_for_release_context(
+    torrent_hash: str,
+) -> dict[str, Any] | None:
+    """
+    Attend que Radarr ou Sonarr expose l'événement "grabbed"
+    contenant l'URL de la page du torrent.
+
+    Une tentative toutes les 5 secondes pendant 1 minute.
+    Aucune notification Discord n'est envoyée sans tracker_url.
+    """
+
+    started_at = time.time()
+    attempt = 0
+
+    while True:
+        attempt += 1
+
+        release = get_release_context(
+            torrent_hash
+        )
+
+        if release.get("tracker_url"):
+            log.info(
+                "[%s] URL du torrent récupérée via %s.",
+                torrent_hash,
+                release.get("source") or "Arr",
+            )
+            return release
+
+        elapsed = time.time() - started_at
+
+        if elapsed >= RELEASE_CONTEXT_TIMEOUT:
+            log.warning(
+                "[%s] URL du torrent introuvable après %ss "
+                "(%d tentative(s)). Notification Discord annulée.",
+                torrent_hash,
+                RELEASE_CONTEXT_TIMEOUT,
+                attempt,
+            )
+            return None
+
+        remaining = max(
+            0,
+            RELEASE_CONTEXT_TIMEOUT - int(elapsed),
+        )
+
+        log.info(
+            "[%s] URL du torrent pas encore disponible "
+            "(tentative %d, nouvelle tentative dans %ss, "
+            "%ss restantes).",
+            torrent_hash,
+            attempt,
+            RELEASE_CONTEXT_RETRY_SECONDS,
+            remaining,
+        )
+
+        time.sleep(
+            RELEASE_CONTEXT_RETRY_SECONDS
+        )
+
+
 def build_qbittorrent_url(
     torrent_hash: str,
 ) -> str:
@@ -411,11 +477,25 @@ def send_discord_message(
 
     try:
 
+        # Discord n'affiche les composants envoyés par un webhook
+        # que si l'option with_components=true est explicitement
+        # demandée sur l'endpoint Execute Webhook.
         response = requests.post(
             DISCORD_WEBHOOK_URL,
+            params={
+                "wait": "true",
+                "with_components": "true",
+            },
             json=payload,
             timeout=10,
         )
+
+        if response.status_code >= 400:
+            log.error(
+                "Discord a refusé la notification : HTTP %s - %s",
+                response.status_code,
+                response.text,
+            )
 
         response.raise_for_status()
 
@@ -443,7 +523,7 @@ def build_discord_components(
             {
                 "type": 2,
                 "style": 5,
-                "label": "Voir le torrent",
+                "label": "🌐 Voir le torrent",
                 "url": tracker_url,
             }
         )
@@ -452,7 +532,7 @@ def build_discord_components(
         {
             "type": 2,
             "style": 5,
-            "label": "Ouvrir qBittorrent",
+            "label": "🖥️ Ouvrir qBittorrent",
             "url": build_qbittorrent_url(
                 torrent_hash
             ),
@@ -522,9 +602,18 @@ def notify_no_french_forced(
         torrent.get("hash", "")
     )
 
-    release = get_release_context(
+    release = wait_for_release_context(
         torrent_hash
     )
+
+    # Aucun message Discord sans URL de la page du torrent.
+    if release is None:
+        log.warning(
+            "[%s] Notification Discord non envoyée : "
+            "URL du torrent indisponible.",
+            torrent_hash,
+        )
+        return
 
     fields = build_release_fields(
         torrent,
@@ -584,9 +673,18 @@ def notify_analysis_error(
         torrent.get("hash", "")
     )
 
-    release = get_release_context(
+    release = wait_for_release_context(
         torrent_hash
     )
+
+    # Aucun message Discord sans URL de la page du torrent.
+    if release is None:
+        log.warning(
+            "[%s] Notification Discord non envoyée : "
+            "URL du torrent indisponible.",
+            torrent_hash,
+        )
+        return
 
     fields = build_release_fields(
         torrent,
@@ -1521,7 +1619,7 @@ def health() -> dict[str, Any]:
 
     return {
         "status": "ok",
-        "version": "1.3.0",
+        "version": "1.3.1",
         "qbittorrent": QB_HOST,
         "monitoring": True,
         "poll_seconds": POLL_SECONDS,
