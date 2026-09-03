@@ -10,6 +10,11 @@ from typing import Any
 import requests
 from fastapi import FastAPI, HTTPException
 
+try:
+    import discord
+except ImportError:
+    discord = None
+
 
 # ============================================================
 # CONFIGURATION
@@ -24,6 +29,9 @@ QB_USERNAME = os.getenv("QB_USERNAME", "")
 QB_PASSWORD = os.getenv("QB_PASSWORD", "")
 
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
+
+DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "").strip()
+DISCORD_CHANNEL_ID = os.getenv("DISCORD_CHANNEL_ID", "").strip()
 
 RADARR_URL = os.getenv("RADARR_URL", "http://192.168.1.42:7878").rstrip("/")
 RADARR_API_KEY = os.getenv("RADARR_API_KEY", "").strip()
@@ -70,7 +78,7 @@ log = logging.getLogger("forcedfr")
 app = FastAPI(
     title="ForcedFR",
     description="Détection automatique des pistes françaises forcées.",
-    version="1.3.1",
+    version="1.4.0",
 )
 
 
@@ -88,6 +96,9 @@ qb_session = requests.Session()
 previous_torrents: set[str] = set()
 
 processing_torrents: set[str] = set()
+
+MAIN_EVENT_LOOP: asyncio.AbstractEventLoop | None = None
+discord_bot: Any = None
 
 
 # ============================================================
@@ -331,6 +342,13 @@ def arr_history_lookup(
 
         data = grabbed.get("data", {}) or {}
 
+        item_id = grabbed.get("movieId") if source == "Radarr" else grabbed.get("seriesId")
+
+        if item_id is not None:
+            arr_item_url = f"{base_url}/movie/{item_id}" if source == "Radarr" else f"{base_url}/series/{item_id}"
+        else:
+            arr_item_url = base_url
+
         return {
             "source": source,
             "title": grabbed.get("sourceTitle"),
@@ -339,6 +357,8 @@ def arr_history_lookup(
                 data.get("nzbInfoUrl")
                 or data.get("infoUrl")
             ),
+            "arr_item_url": arr_item_url,
+            "item_id": item_id,
             "event_type": grabbed.get("eventType"),
         }
 
@@ -383,6 +403,8 @@ def get_release_context(
         "title": None,
         "indexer": None,
         "tracker_url": None,
+        "arr_item_url": None,
+        "item_id": None,
         "event_type": None,
     }
 
@@ -455,96 +477,149 @@ def build_qbittorrent_url(
     return f"{QB_HOST}/#torrent={torrent_hash}"
 
 
+async def _send_discord_bot_message(
+    *,
+    embeds: list[dict[str, Any]],
+    torrent_hash: str,
+    release: dict[str, Any],
+) -> None:
+    if discord_bot is None or not discord_bot.is_ready():
+        raise RuntimeError("Bot Discord non prêt.")
+
+    if not DISCORD_CHANNEL_ID:
+        raise RuntimeError("DISCORD_CHANNEL_ID non configuré.")
+
+    channel = discord_bot.get_channel(int(DISCORD_CHANNEL_ID))
+    if channel is None:
+        channel = await discord_bot.fetch_channel(int(DISCORD_CHANNEL_ID))
+
+    embed_objects = [discord.Embed.from_dict(embed) for embed in embeds]
+    view = ForcedFRView(torrent_hash, release)
+    await channel.send(embeds=embed_objects, view=view)
+
+
 def send_discord_message(
     *,
     embeds: list[dict[str, Any]],
-    components: list[dict[str, Any]] | None = None,
+    torrent_hash: str | None = None,
+    release: dict[str, Any] | None = None,
 ) -> None:
-
-    if not DISCORD_WEBHOOK_URL:
-        log.warning(
-            "Webhook Discord non configuré : notification ignorée."
-        )
-        return
-
-    payload: dict[str, Any] = {
-        "username": "ForcedFR",
-        "embeds": embeds,
-    }
-
-    if components:
-        payload["components"] = components
-
-    try:
-
-        # Discord n'affiche les composants envoyés par un webhook
-        # que si l'option with_components=true est explicitement
-        # demandée sur l'endpoint Execute Webhook.
-        response = requests.post(
-            DISCORD_WEBHOOK_URL,
-            params={
-                "wait": "true",
-                "with_components": "true",
-            },
-            json=payload,
-            timeout=10,
-        )
-
-        if response.status_code >= 400:
-            log.error(
-                "Discord a refusé la notification : HTTP %s - %s",
-                response.status_code,
-                response.text,
+    """Envoie la notification via le bot pour permettre les boutons interactifs."""
+    if discord_bot is not None and MAIN_EVENT_LOOP is not None and torrent_hash and release:
+        try:
+            future = asyncio.run_coroutine_threadsafe(
+                _send_discord_bot_message(
+                    embeds=embeds,
+                    torrent_hash=torrent_hash,
+                    release=release,
+                ),
+                MAIN_EVENT_LOOP,
             )
+            future.result(timeout=15)
+            log.info("Notification Discord envoyée via le bot.")
+            return
+        except Exception:
+            log.exception("Impossible d'envoyer la notification via le bot Discord.")
+            return
 
-        response.raise_for_status()
-
-        log.info(
-            "Notification Discord envoyée."
-        )
-
-    except Exception:
-
-        log.exception(
-            "Impossible d'envoyer la notification Discord."
-        )
+    log.warning("Bot Discord indisponible : notification interactive non envoyée.")
 
 
-def build_discord_components(
-    torrent_hash: str,
-    tracker_url: str | None,
-) -> list[dict[str, Any]]:
+class ForcedFRView(discord.ui.View if discord else object):
+    def __init__(self, torrent_hash: str, release: dict[str, Any]) -> None:
+        if discord is None:
+            return
+        super().__init__(timeout=None)
 
-    buttons = []
+        tracker_url = release.get("tracker_url")
+        arr_item_url = release.get("arr_item_url")
+        source = release.get("source")
 
-    if tracker_url:
+        if tracker_url:
+            self.add_item(discord.ui.Button(
+                label="🌐 Voir le torrent",
+                style=discord.ButtonStyle.link,
+                url=tracker_url,
+            ))
 
-        buttons.append(
-            {
-                "type": 2,
-                "style": 5,
-                "label": "🌐 Voir le torrent",
-                "url": tracker_url,
-            }
-        )
+        self.add_item(discord.ui.Button(
+            label="🖥️ Ouvrir qBittorrent",
+            style=discord.ButtonStyle.link,
+            url=build_qbittorrent_url(torrent_hash),
+        ))
 
-    buttons.append(
-        {
-            "type": 2,
-            "style": 5,
-            "label": "🖥️ Ouvrir qBittorrent",
-            "url": build_qbittorrent_url(
-                torrent_hash
-            ),
-        }
-    )
+        if arr_item_url:
+            label = "🎬 Ouvrir Radarr" if source == "Radarr" else "📺 Ouvrir Sonarr"
+            self.add_item(discord.ui.Button(
+                label=label,
+                style=discord.ButtonStyle.link,
+                url=arr_item_url,
+            ))
 
-    return [
-        {
-            "type": 1,
-            "components": buttons,
-        }
-    ]
+        self.add_item(discord.ui.Button(
+            label="▶️ Continuer le téléchargement",
+            style=discord.ButtonStyle.success,
+            custom_id=f"forcedfr:resume:{torrent_hash}",
+        ))
+
+        self.add_item(discord.ui.Button(
+            label="⏸️ Laisser en pause",
+            style=discord.ButtonStyle.secondary,
+            custom_id=f"forcedfr:pause:{torrent_hash}",
+        ))
+
+
+def build_discord_bot() -> Any:
+    if discord is None:
+        return None
+
+    intents = discord.Intents.none()
+    bot = discord.Client(intents=intents)
+
+    @bot.event
+    async def on_ready() -> None:
+        log.info("Bot Discord connecté : %s", bot.user)
+        if DISCORD_CHANNEL_ID:
+            log.info("Salon Discord configuré : %s", DISCORD_CHANNEL_ID)
+
+    @bot.event
+    async def on_interaction(interaction: Any) -> None:
+        try:
+            data = interaction.data or {}
+            custom_id = str(data.get("custom_id", ""))
+
+            if not custom_id.startswith("forcedfr:"):
+                return
+
+            _, action, torrent_hash = custom_id.split(":", 2)
+
+            if action == "resume":
+                await asyncio.to_thread(start_torrent, torrent_hash)
+                message = "▶️ Téléchargement repris dans qBittorrent."
+                log.info("[%s] Reprise demandée depuis Discord par %s.", torrent_hash, interaction.user)
+            elif action == "pause":
+                await asyncio.to_thread(stop_torrent, torrent_hash)
+                message = "⏸️ Le téléchargement reste en pause dans qBittorrent."
+                log.info("[%s] Maintien en pause demandé depuis Discord par %s.", torrent_hash, interaction.user)
+            else:
+                return
+
+            await interaction.response.send_message(message, ephemeral=True)
+
+        except HTTPException:
+            await interaction.response.send_message(
+                "⚠️ Ce torrent n'existe plus dans qBittorrent.",
+                ephemeral=True,
+            )
+        except Exception as exc:
+            log.exception("Erreur lors d'une interaction Discord : %s", exc)
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    "⚠️ Impossible d'exécuter cette action.",
+                    ephemeral=True,
+                )
+
+    return bot
 
 
 def build_release_fields(
@@ -657,10 +732,8 @@ def notify_no_french_forced(
                 },
             }
         ],
-        components=build_discord_components(
-            torrent_hash,
-            release.get("tracker_url"),
-        ),
+        torrent_hash=torrent_hash,
+        release=release,
     )
 
 
@@ -737,10 +810,8 @@ def notify_analysis_error(
                 },
             }
         ],
-        components=build_discord_components(
-            torrent_hash,
-            release.get("tracker_url"),
-        ),
+        torrent_hash=torrent_hash,
+        release=release,
     )
 
 
@@ -1569,6 +1640,9 @@ async def monitor_qbittorrent() -> None:
 @app.on_event("startup")
 async def startup() -> None:
 
+    global MAIN_EVENT_LOOP, discord_bot
+    MAIN_EVENT_LOOP = asyncio.get_running_loop()
+
     log.info(
         "========================================"
     )
@@ -1601,6 +1675,16 @@ async def startup() -> None:
                 "Connexion initiale qBittorrent échouée."
             )
 
+    if not DISCORD_BOT_TOKEN:
+        log.warning("DISCORD_BOT_TOKEN non configuré : les boutons interactifs Discord sont indisponibles.")
+    elif not DISCORD_CHANNEL_ID:
+        log.warning("DISCORD_CHANNEL_ID non configuré : les notifications Discord sont indisponibles.")
+    elif discord is None:
+        log.error("Le module discord.py est absent. Ajoute discord.py aux dépendances du conteneur.")
+    else:
+        discord_bot = build_discord_bot()
+        asyncio.create_task(discord_bot.start(DISCORD_BOT_TOKEN))
+
     asyncio.create_task(
         monitor_qbittorrent()
     )
@@ -1608,6 +1692,20 @@ async def startup() -> None:
     log.info(
         "========================================"
     )
+
+
+# ============================================================
+# SHUTDOWN
+# ============================================================
+
+@app.on_event("shutdown")
+async def shutdown() -> None:
+    global discord_bot
+    if discord_bot is not None:
+        try:
+            await discord_bot.close()
+        except Exception:
+            log.exception("Erreur lors de l'arrêt du bot Discord.")
 
 
 # ============================================================
@@ -1619,7 +1717,7 @@ def health() -> dict[str, Any]:
 
     return {
         "status": "ok",
-        "version": "1.3.1",
+        "version": "1.4.0",
         "qbittorrent": QB_HOST,
         "monitoring": True,
         "poll_seconds": POLL_SECONDS,
