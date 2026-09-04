@@ -90,7 +90,7 @@ log = logging.getLogger("forcedfr")
 app = FastAPI(
     title="ForcedFR",
     description="Détection automatique des pistes françaises forcées.",
-    version="2.1.2",
+    version="2.1.3",
 )
 
 
@@ -323,9 +323,9 @@ def arr_item_url_lookup(
     Construit l'URL de la page web Radarr/Sonarr.
 
     Les IDs présents dans l'historique sont des IDs internes Arr.
-    L'interface web utilise des IDs externes :
+    L'interface web utilise :
     - Radarr : tmdbId
-    - Sonarr : tvdbId
+    - Sonarr : titleSlug (slug lisible de la série)
 
     En cas d'échec de la requête complémentaire, on conserve
     l'URL basée sur l'ID interne afin de ne jamais bloquer
@@ -363,9 +363,12 @@ def arr_item_url_lookup(
                 return f"{base_url}/movie/{external_id}"
 
         else:
-            external_id = item.get("tvdbId")
-            if external_id and str(external_id) != "0":
-                return f"{base_url}/series/{external_id}"
+            # Sonarr n'utilise pas le TVDB ID dans l'URL de sa page série.
+            # L'interface web attend le titleSlug, par exemple :
+            # /series/baron-noir
+            title_slug = item.get("titleSlug")
+            if title_slug:
+                return f"{base_url}/series/{title_slug}"
 
         log.warning(
             "[%s] Identifiant externe introuvable pour %s ID %s. "
@@ -2336,12 +2339,13 @@ def _sonarr_scan_items() -> list[dict[str, Any]]:
             continue
 
         try:
-            # Même logique d'URL que le bot Discord : Sonarr utilise le TVDB ID
-            # dans l'URL publique /series/<tvdbId>.
-            tvdb_id = series.get("tvdbId")
-            if tvdb_id and str(tvdb_id) != "0":
-                series_url = f"{SONARR_URL}/series/{tvdb_id}"
+            # URL native de Sonarr : /series/<titleSlug>
+            # Exemple : /series/baron-noir
+            title_slug = series.get("titleSlug")
+            if title_slug:
+                series_url = f"{SONARR_URL}/series/{title_slug}"
             else:
+                # Même logique de secours que le bot Discord.
                 series_url = arr_item_url_lookup(
                     SONARR_URL,
                     SONARR_API_KEY,
@@ -2560,7 +2564,7 @@ select,input{background:#0f141b;color:white;border:1px solid var(--b);border-rad
 .badge{font-weight:700}.yes{color:var(--g)}.no{color:var(--r)}.err{color:var(--y)}a.btn{background:#1f6feb;color:white;text-decoration:none;padding:7px 10px;border-radius:7px;font-size:.82rem}
 .empty{color:var(--m);text-align:center;padding:22px}@media(max-width:700px){main{padding:16px}}
 </style></head><body><main>
-<h1>ForcedFR <span class="small">v2.1.2</span></h1><p class="sub">Surveillance qBittorrent et contrôle des bibliothèques Radarr / Sonarr.</p>
+<h1>ForcedFR <span class="small">v2.1.3</span></h1><p class="sub">Surveillance qBittorrent et contrôle des bibliothèques Radarr / Sonarr.</p>
 <div class="grid">
 <div class="card"><div class="label">ForcedFR</div><div class="value ok">● En ligne</div></div>
 <div class="card"><div class="label">qBittorrent</div><div class="value" id="qb">…</div></div>
