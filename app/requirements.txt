@@ -2,3 +2,4 @@ fastapi
 uvicorn[standard]
 requests
 discord.py>=2.4.0,<3.0
+jinja2
