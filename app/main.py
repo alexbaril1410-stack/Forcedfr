@@ -58,6 +58,11 @@ LOG_LEVEL = os.getenv(
 RELEASE_CONTEXT_RETRY_SECONDS = 5
 RELEASE_CONTEXT_TIMEOUT = 60
 
+# Stabilisation de qBittorrent au démarrage : évite de considérer comme nouveaux
+# les torrents restaurés progressivement après un redémarrage du serveur.
+STARTUP_STABILITY_CHECK_SECONDS = 5
+STARTUP_STABLE_CHECKS_REQUIRED = 3
+
 
 # ============================================================
 # LOGGING
@@ -78,7 +83,7 @@ log = logging.getLogger("forcedfr")
 app = FastAPI(
     title="ForcedFR",
     description="Détection automatique des pistes françaises forcées.",
-    version="1.4.0",
+    version="1.4.1",
 )
 
 
@@ -1545,40 +1550,96 @@ async def monitor_qbittorrent() -> None:
 
     global previous_torrents
 
+    # --------------------------------------------------------
+    # Stabilisation de qBittorrent au démarrage
+    # --------------------------------------------------------
+    # Après un redémarrage du serveur, qBittorrent peut restaurer
+    # ses torrents progressivement. On attend donc que la liste
+    # soit inchangée pendant 3 vérifications espacées de 5 secondes
+    # avant d'enregistrer la référence initiale.
+
+    log.info(
+        "Attente de stabilisation de qBittorrent..."
+    )
+
+    stable_snapshot: set[str] | None = None
+    stable_checks = 0
+
+    while stable_checks < STARTUP_STABLE_CHECKS_REQUIRED:
+
+        try:
+
+            torrents = get_torrents()
+
+            current_snapshot = {
+                torrent["hash"]
+                for torrent in torrents
+                if torrent.get("hash")
+            }
+
+            if stable_snapshot is None:
+
+                stable_snapshot = current_snapshot
+                stable_checks = 0
+
+                log.info(
+                    "Liste détectée : %d torrent(s). "
+                    "Vérification de stabilité en cours...",
+                    len(current_snapshot),
+                )
+
+            elif current_snapshot == stable_snapshot:
+
+                stable_checks += 1
+
+                log.info(
+                    "Liste stable (%d/%d) : %d torrent(s).",
+                    stable_checks,
+                    STARTUP_STABLE_CHECKS_REQUIRED,
+                    len(current_snapshot),
+                )
+
+            else:
+
+                log.info(
+                    "Liste modifiée (%d → %d torrents). "
+                    "Nouvelle période de stabilisation.",
+                    len(stable_snapshot),
+                    len(current_snapshot),
+                )
+
+                stable_snapshot = current_snapshot
+                stable_checks = 0
+
+        except Exception:
+
+            log.warning(
+                "qBittorrent pas encore prêt. "
+                "Nouvelle tentative dans %ss.",
+                STARTUP_STABILITY_CHECK_SECONDS,
+            )
+
+            stable_snapshot = None
+            stable_checks = 0
+
+        if stable_checks < STARTUP_STABLE_CHECKS_REQUIRED:
+            await asyncio.sleep(
+                STARTUP_STABILITY_CHECK_SECONDS
+            )
+
+    previous_torrents = stable_snapshot or set()
+
+    log.info(
+        "qBittorrent stabilisé. %d torrent(s) présents au démarrage "
+        "et ignorés.",
+        len(previous_torrents),
+    )
+
     log.info(
         "Surveillance qBittorrent démarrée "
         "(intervalle : %ss).",
         POLL_SECONDS,
     )
-
-    # --------------------------------------------------------
-    # Référence initiale
-    # --------------------------------------------------------
-
-    try:
-
-        torrents = get_torrents()
-
-        previous_torrents = {
-            torrent["hash"]
-            for torrent in torrents
-            if torrent.get("hash")
-        }
-
-        log.info(
-            "%d torrent(s) présents au démarrage "
-            "et ignorés.",
-            len(previous_torrents),
-        )
-
-    except Exception:
-
-        log.exception(
-            "Impossible d'établir la liste "
-            "initiale des torrents."
-        )
-
-        previous_torrents = set()
 
     # --------------------------------------------------------
     # Surveillance permanente
