@@ -90,7 +90,7 @@ log = logging.getLogger("forcedfr")
 app = FastAPI(
     title="ForcedFR",
     description="Détection automatique des pistes françaises forcées.",
-    version="2.1.1",
+    version="2.1.2",
 )
 
 
@@ -1610,7 +1610,12 @@ def process_new_torrent(
                         "[%s] ✅ FR Forced détecté.",
                         torrent_hash,
                     )
-
+                    record_analysis_history(
+                        torrent_hash,
+                        str(torrent.get("name", "")),
+                        "forced_found",
+                        "Piste FR Forced détectée.",
+                    )
                     return
 
                 # ------------------------------------------------
@@ -1625,6 +1630,13 @@ def process_new_torrent(
 
                 stop_torrent(
                     torrent_hash
+                )
+
+                record_analysis_history(
+                    torrent_hash,
+                    str(torrent.get("name", "")),
+                    "no_forced",
+                    "Aucune piste FR Forced détectée. Torrent mis en pause.",
                 )
 
                 notify_no_french_forced(
@@ -2169,6 +2181,27 @@ def _load_arr_path_mappings() -> list[tuple[str, str]]:
 ARR_PATH_MAPPINGS = _load_arr_path_mappings()
 SERVICE_STARTED_AT = time.time()
 
+# Préparation SQLite : historique isolé derrière cette structure mémoire.
+analysis_history: list[dict[str, Any]] = []
+ANALYSIS_HISTORY_LIMIT = int(os.getenv("ANALYSIS_HISTORY_LIMIT", "500"))
+
+
+def record_analysis_history(
+    torrent_hash: str,
+    torrent_name: str,
+    result: str,
+    details: str | None = None,
+) -> None:
+    analysis_history.insert(0, {
+        "timestamp": time.time(),
+        "torrent_hash": torrent_hash,
+        "torrent_name": torrent_name,
+        "result": result,
+        "details": details,
+    })
+    del analysis_history[ANALYSIS_HISTORY_LIMIT:]
+
+
 scan_lock = threading.Lock()
 scan_state: dict[str, Any] = {
     "running": False,
@@ -2187,6 +2220,14 @@ scan_state: dict[str, Any] = {
 
 
 def _scan_reset(scope: str) -> None:
+    existing_results = list(scan_state.get("results", []))
+    if scope == "films":
+        existing_results = [r for r in existing_results if r.get("type") != "Film"]
+    elif scope == "series":
+        existing_results = [r for r in existing_results if r.get("type") != "Série"]
+    else:
+        existing_results = []
+
     scan_state.update({
         "running": True,
         "requested_scope": scope,
@@ -2198,7 +2239,7 @@ def _scan_reset(scope: str) -> None:
         "files_with_forced_fr": 0,
         "files_without_forced_fr": 0,
         "errors": 0,
-        "results": [],
+        "results": existing_results,
         "last_error": None,
     })
 
@@ -2218,6 +2259,26 @@ def _arr_request(base_url: str, api_key: str, endpoint: str, params: dict[str, A
     )
     response.raise_for_status()
     return response.json()
+
+
+def _arr_connection_status(base_url: str, api_key: str) -> dict[str, Any]:
+    if not base_url or not api_key:
+        return {"status": "not_configured", "configured": False, "url": base_url or None}
+    try:
+        data = _arr_request(base_url, api_key, "system/status")
+        return {
+            "status": "connected",
+            "configured": True,
+            "url": base_url,
+            "version": data.get("version"),
+        }
+    except Exception as exc:
+        return {
+            "status": "error",
+            "configured": True,
+            "url": base_url,
+            "error": str(exc),
+        }
 
 
 def _resolve_arr_media_path(raw_path: str | None) -> Path | None:
@@ -2258,11 +2319,13 @@ def _radarr_scan_items() -> list[dict[str, Any]]:
 
 
 def _sonarr_scan_items() -> list[dict[str, Any]]:
-    """Récupère les épisodes depuis Sonarr avec leurs métadonnées natives.
+    """
+    Construit la liste des épisodes à analyser directement depuis Sonarr.
 
-    Important : le nom de la série, la saison et l'épisode ne sont plus
-    reconstruits depuis le nom du fichier. On utilise directement les données
-    retournées par Sonarr.
+    Important : les métadonnées saison/épisode ne sont pas toujours présentes
+    dans /episodefile. Elles sont récupérées depuis /episode et associées via
+    episodeFileId. Cela évite toute tentative de déduction depuis le nom du
+    fichier.
     """
     series_list = _arr_request(SONARR_URL, SONARR_API_KEY, "series")
     items: list[dict[str, Any]] = []
@@ -2272,56 +2335,101 @@ def _sonarr_scan_items() -> list[dict[str, Any]]:
         if series_id is None:
             continue
 
-        # Même logique que celle utilisée par le bot Discord.
-        series_url = arr_item_url_lookup(
-            SONARR_URL,
-            SONARR_API_KEY,
-            "Sonarr",
-            series_id,
-        )
-
         try:
+            # Même logique d'URL que le bot Discord : Sonarr utilise le TVDB ID
+            # dans l'URL publique /series/<tvdbId>.
+            tvdb_id = series.get("tvdbId")
+            if tvdb_id and str(tvdb_id) != "0":
+                series_url = f"{SONARR_URL}/series/{tvdb_id}"
+            else:
+                series_url = arr_item_url_lookup(
+                    SONARR_URL,
+                    SONARR_API_KEY,
+                    "Sonarr",
+                    series_id,
+                )
+
             episode_files = _arr_request(
                 SONARR_URL,
                 SONARR_API_KEY,
                 "episodefile",
                 {"seriesId": series_id},
             )
+            episodes = _arr_request(
+                SONARR_URL,
+                SONARR_API_KEY,
+                "episode",
+                {"seriesId": series_id},
+            )
         except Exception as exc:
             log.warning(
-                "[SCAN] Impossible de récupérer les fichiers de la série '%s' : %s",
+                "[SCAN] Impossible de récupérer les épisodes de la série '%s' : %s",
                 series.get("title"),
                 exc,
             )
             continue
+
+        # Association episodeFileId -> métadonnées épisode Sonarr.
+        episodes_by_file_id: dict[Any, list[dict[str, Any]]] = {}
+        for episode in episodes if isinstance(episodes, list) else []:
+            file_id = episode.get("episodeFileId")
+            if file_id is not None and str(file_id) not in ("", "0"):
+                # Normalisation en chaîne pour éviter les différences int/string
+                # selon les versions de l'API Sonarr.
+                episodes_by_file_id.setdefault(str(file_id), []).append(episode)
 
         for episode_file in episode_files if isinstance(episode_files, list) else []:
             raw_path = episode_file.get("path")
             if not raw_path:
                 continue
 
-            season_number = episode_file.get("seasonNumber")
-            episodes = episode_file.get("episodes") or []
-            episode_numbers = [
-                ep.get("episodeNumber")
-                for ep in episodes
-                if ep.get("episodeNumber") is not None
-            ]
+            linked_episodes = episodes_by_file_id.get(str(episode_file.get("id")), [])
+            linked_episodes.sort(
+                key=lambda ep: (ep.get("seasonNumber", 0), ep.get("episodeNumber", 0))
+            )
 
-            # La majorité des fichiers correspondent à un seul épisode.
-            # Pour les rares fichiers multi-épisodes, on conserve une liste
-            # compacte dans la même colonne (ex. E01-E02).
-            if len(episode_numbers) == 1:
-                episode_number: Any = episode_numbers[0]
-            elif episode_numbers:
-                episode_number = "-".join(f"E{int(n):02d}" for n in episode_numbers)
-            else:
-                episode_number = None
+            season_number = None
+            episode_number = None
+            episode_label = None
+
+            if linked_episodes:
+                first_episode = linked_episodes[0]
+                season_number = first_episode.get("seasonNumber")
+                numbers = [ep.get("episodeNumber") for ep in linked_episodes if ep.get("episodeNumber") is not None]
+                if len(numbers) == 1:
+                    episode_number = numbers[0]
+                    episode_label = f"E{int(numbers[0]):02d}"
+                elif numbers:
+                    episode_number = numbers[0]
+                    episode_label = " / ".join(f"E{int(n):02d}" for n in numbers)
+
+            # Compatibilité avec certaines versions de Sonarr qui peuvent
+            # fournir seasonNumber/episodes directement dans episodefile.
+            if season_number is None:
+                season_number = episode_file.get("seasonNumber")
+            if episode_label is None:
+                embedded = episode_file.get("episodes") or []
+                numbers = [ep.get("episodeNumber") for ep in embedded if ep.get("episodeNumber") is not None]
+
+                # Certaines réponses Sonarr exposent directement une liste
+                # episodeNumbers au lieu d'un tableau episodes.
+                if not numbers:
+                    raw_numbers = episode_file.get("episodeNumbers") or []
+                    if isinstance(raw_numbers, list):
+                        numbers = [n for n in raw_numbers if n is not None]
+
+                if len(numbers) == 1:
+                    episode_number = numbers[0]
+                    episode_label = f"E{int(numbers[0]):02d}"
+                elif numbers:
+                    episode_number = numbers[0]
+                    episode_label = " / ".join(f"E{int(n):02d}" for n in numbers)
 
             items.append({
                 "type": "Série",
                 "title": series.get("title") or Path(raw_path).stem,
-                "series_title": series.get("title") or Path(raw_path).stem,
+                "season": f"S{int(season_number):02d}" if season_number is not None else None,
+                "episode": episode_label,
                 "season_number": season_number,
                 "episode_number": episode_number,
                 "raw_path": raw_path,
@@ -2330,9 +2438,7 @@ def _sonarr_scan_items() -> list[dict[str, Any]]:
                 "arr_url": series_url,
                 "arr_id": series_id,
             })
-
     return items
-
 
 def _scan_items(scope: str) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
@@ -2363,11 +2469,12 @@ def run_library_scan(scope: str) -> None:
                 "relative_path": raw_path or item.get("title"),
                 "type": item.get("type", "inconnu"),
                 "title": item.get("title"),
-                "series_title": item.get("series_title"),
-                "season_number": item.get("season_number"),
-                "episode_number": item.get("episode_number"),
                 "arr_source": item.get("arr_source"),
                 "arr_url": item.get("arr_url"),
+                "season": item.get("season"),
+                "episode": item.get("episode"),
+                "season_number": item.get("season_number"),
+                "episode_number": item.get("episode_number"),
                 "forced_french": False,
                 "status": "ok",
                 "error": None,
@@ -2388,6 +2495,7 @@ def run_library_scan(scope: str) -> None:
                     scan_state["files_with_forced_fr"] += 1
                 else:
                     scan_state["files_without_forced_fr"] += 1
+
                 scan_state["results"].append(result)
             except Exception as exc:
                 result["status"] = "error"
@@ -2437,72 +2545,73 @@ def _qbittorrent_status() -> tuple[str, int | None]:
 @app.get("/", response_class=HTMLResponse)
 def web_dashboard() -> str:
     return """<!doctype html>
-<html lang="fr">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>ForcedFR v2.1.1</title>
 <style>
-:root{color-scheme:dark;font-family:Inter,system-ui,Arial,sans-serif}*{box-sizing:border-box}
-body{margin:0;background:#0d1117;color:#e6edf3}main{max-width:1300px;margin:auto;padding:28px}
-h1{margin:0;font-size:2rem}.sub,.small{color:#8b949e}.sub{margin:6px 0 24px}.small{font-size:.82rem}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:14px}.card{background:#161b22;border:1px solid #30363d;border-radius:14px;padding:18px}
-.label{color:#8b949e;font-size:.85rem}.value{font-size:1.15rem;font-weight:700;margin-top:8px}.ok{color:#3fb950}.warn{color:#d29922}.bad{color:#f85149}
-.tabs{display:flex;gap:8px;margin:26px 0 18px}.tab{background:#21262d}.tab.active{background:#238636}
-button{border:0;border-radius:9px;padding:11px 15px;font-weight:700;cursor:pointer;background:#238636;color:#fff}.secondary{background:#30363d}.tabpane{display:none}.tabpane.active{display:block}
-.actions{display:flex;flex-wrap:wrap;gap:10px;margin:12px 0 18px}.progress{height:12px;background:#21262d;border-radius:999px;overflow:hidden}.progress>div{height:100%;background:#238636;width:0%;transition:.3s}
-.result-grid{display:grid;grid-template-columns:1fr 1fr;gap:22px;align-items:start}.result-card{min-width:0}.table-wrap{overflow:auto;border:1px solid #30363d;border-radius:12px}
-table{width:100%;border-collapse:collapse;background:#161b22}th,td{text-align:left;padding:11px;border-bottom:1px solid #30363d;font-size:.9rem;white-space:nowrap}th{background:#21262d}.yes{color:#3fb950;font-weight:700}.no{color:#f85149;font-weight:700}
-a.open{display:inline-block;background:#30363d;color:#fff;text-decoration:none;padding:7px 10px;border-radius:7px;font-size:.82rem}.empty{padding:20px;color:#8b949e;text-align:center}
-.filters{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0}.filters select,.filters input{background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:8px;padding:9px}
-@media(max-width:900px){.result-grid{grid-template-columns:1fr}main{padding:16px}}
-</style>
-</head>
-<body><main>
-<h1>ForcedFR <span class="small">v2.1.1</span></h1><p class="sub">Surveillance des torrents et contrôle de la bibliothèque média.</p>
+:root{color-scheme:dark;--bg:#0d1117;--p:#161b22;--b:#30363d;--m:#8b949e;--t:#e6edf3;--g:#3fb950;--y:#d29922;--r:#f85149;font-family:Inter,system-ui,sans-serif}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--t)}main{max-width:1320px;margin:auto;padding:28px}h1{margin:0}.sub,.small{color:var(--m)}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px}.card,.tablewrap{background:var(--p);border:1px solid var(--b);border-radius:14px;padding:16px}
+.label{color:var(--m);font-size:.8rem;text-transform:uppercase}.value{font-weight:700;margin-top:8px}.ok{color:var(--g)}.warn{color:var(--y)}.bad{color:var(--r)}
+.tabs,.subtabs,.toolbar,.filters{display:flex;gap:8px;flex-wrap:wrap}.tabs{margin:28px 0 18px;border-bottom:1px solid var(--b);padding-bottom:10px}
+.tab,.subtab,button{border:0;border-radius:8px;padding:10px 14px;font-weight:700;cursor:pointer;background:#30363d;color:white}.tab.active,.subtab.active{background:#21262d}
+.panel{display:none}.panel.active{display:block}.progress{height:11px;background:#21262d;border-radius:999px;overflow:hidden;margin-top:10px}.progress div{height:100%;width:0;background:#238636;transition:.3s}
+select,input{background:#0f141b;color:white;border:1px solid var(--b);border-radius:8px;padding:9px}input{min-width:220px;flex:1}
+.tablewrap{padding:0;overflow:auto}table{width:100%;border-collapse:collapse;min-width:650px}th,td{padding:12px;text-align:left;border-bottom:1px solid var(--b)}th{color:var(--m);font-size:.78rem;text-transform:uppercase}
+.badge{font-weight:700}.yes{color:var(--g)}.no{color:var(--r)}.err{color:var(--y)}a.btn{background:#1f6feb;color:white;text-decoration:none;padding:7px 10px;border-radius:7px;font-size:.82rem}
+.empty{color:var(--m);text-align:center;padding:22px}@media(max-width:700px){main{padding:16px}}
+</style></head><body><main>
+<h1>ForcedFR <span class="small">v2.1.2</span></h1><p class="sub">Surveillance qBittorrent et contrôle des bibliothèques Radarr / Sonarr.</p>
 <div class="grid">
- <div class="card"><div class="label">ForcedFR</div><div class="value ok" id="service">Chargement…</div></div>
- <div class="card"><div class="label">qBittorrent</div><div class="value" id="qb">Chargement…</div></div>
- <div class="card"><div class="label">Discord</div><div class="value" id="discord">Chargement…</div></div>
- <div class="card"><div class="label">Radarr</div><div class="value" id="radarr">Chargement…</div></div>
- <div class="card"><div class="label">Sonarr</div><div class="value" id="sonarr">Chargement…</div></div>
-</div>
-<div class="tabs"><button class="tab active" onclick="showTab('scan',this)">🔍 Scan</button><button class="tab" onclick="showTab('history',this)">📜 Historique qBittorrent</button></div>
-<div id="scan" class="tabpane active">
- <section class="card"><h2>Scanner la bibliothèque</h2><div class="actions"><button onclick="scan('films')">🎬 Scanner les films</button><button onclick="scan('series')">📺 Scanner les séries</button><button class="secondary" onclick="scan('all')">🔍 Tout scanner</button></div><div class="label" id="scanLabel">Aucun scan en cours.</div><div class="progress"><div id="bar"></div></div><div class="small" id="scanStats" style="margin-top:10px"></div></section>
- <div class="filters"><select id="filter"><option value="all">Tous les résultats</option><option value="missing">Sans Forced FR</option><option value="forced">Avec Forced FR</option><option value="error">Erreurs</option></select><input id="search" placeholder="Rechercher une série ou un film…"></div>
- <div class="result-grid">
-  <section class="result-card"><h2>🎬 Films</h2><div class="table-wrap"><table><thead><tr><th>Film</th><th>Forced FR</th><th>Action</th></tr></thead><tbody id="filmResults"></tbody></table></div></section>
-  <section class="result-card"><h2>📺 Séries</h2><div class="table-wrap"><table><thead><tr><th>Série</th><th>Saison</th><th>Épisode</th><th>Forced FR</th><th>Action</th></tr></thead><tbody id="seriesResults"></tbody></table></div></section>
- </div>
-</div>
-<div id="history" class="tabpane"><section class="card"><h2>Historique qBittorrent</h2><p class="small">L'historique des analyses de nouveaux torrents sera affiché ici. La structure est préparée pour une future persistance SQLite.</p></section></div>
-</main>
+<div class="card"><div class="label">ForcedFR</div><div class="value ok">● En ligne</div></div>
+<div class="card"><div class="label">qBittorrent</div><div class="value" id="qb">…</div></div>
+<div class="card"><div class="label">Discord</div><div class="value" id="discord">…</div></div>
+<div class="card"><div class="label">Radarr</div><div class="value" id="radarr">…</div></div>
+<div class="card"><div class="label">Sonarr</div><div class="value" id="sonarr">…</div></div></div>
+
+<div class="tabs"><button class="tab active" data-tab="scan">🔍 Scan de bibliothèque</button><button class="tab" data-tab="history">📜 Historique qBittorrent</button></div>
+
+<section id="p-scan" class="panel active">
+<div class="card"><div class="toolbar"><button onclick="startScan('films')">🎬 Scanner les films</button><button onclick="startScan('series')">📺 Scanner les séries</button><button onclick="startScan('all')">🔍 Scanner toute la bibliothèque</button></div>
+<div class="small" id="scanLabel">Aucun scan en cours.</div><div class="progress"><div id="bar"></div></div><div class="small" id="stats"></div></div>
+<div class="subtabs" style="margin:20px 0"><button class="subtab active" data-kind="films">🎬 Films</button><button class="subtab" data-kind="series">📺 Séries</button></div>
+
+<div id="k-films"><h2>Films</h2><div class="filters"><select id="ff"><option value="all">Tous</option><option value="yes">Avec Forced FR</option><option value="no">Sans Forced FR</option><option value="error">Erreurs</option></select><input id="fs" placeholder="Rechercher un film…"></div>
+<div class="tablewrap"><table><thead><tr><th>Film</th><th>Forced FR</th><th>Action</th></tr></thead><tbody id="films"></tbody></table></div></div>
+
+<div id="k-series" style="display:none"><h2>Séries</h2><div class="filters"><select id="sf"><option value="all">Tous</option><option value="yes">Avec Forced FR</option><option value="no">Sans Forced FR</option><option value="error">Erreurs</option></select><input id="ss" placeholder="Rechercher une série ou un épisode…"></div>
+<div class="tablewrap"><table><thead><tr><th>Série</th><th>Saison</th><th>Épisode</th><th>Forced FR</th><th>Action</th></tr></thead><tbody id="series"></tbody></table></div></div>
+</section>
+
+<section id="p-history" class="panel"><h2>Historique des analyses qBittorrent</h2><p class="sub">Historique mémoire, préparé pour une future migration SQLite.</p>
+<div class="tablewrap"><table><thead><tr><th>Date</th><th>Torrent</th><th>Résultat</th><th>Détails</th></tr></thead><tbody id="history"></tbody></table></div></section>
+
 <script>
-async function api(url,opt={}){const r=await fetch(url,opt);const d=await r.json();if(!r.ok)throw new Error(d.detail||'Erreur API');return d}
-function esc(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[c]))}
-function showTab(id,b){document.querySelectorAll('.tabpane').forEach(x=>x.classList.remove('active'));document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));document.getElementById(id).classList.add('active');b.classList.add('active')}
-let refreshTimer=null,previousScanRunning=null,resultsLoaded=false,allResults=[];
-async function scan(scope){try{resultsLoaded=false;await api('/scan/'+scope,{method:'POST'});clearTimeout(refreshTimer);refresh()}catch(e){alert(e.message)}}
-function fmtSeason(v){return v===null||v===undefined||v===''?'—':'S'+String(v).padStart(2,'0')}
-function fmtEpisode(v){if(v===null||v===undefined||v==='')return '—';return String(v).startsWith('E')?String(v):'E'+String(v).padStart(2,'0')}
-function stateCell(a){if(a.status==='error')return '<span class="bad">⚠ Erreur</span>';return a.forced_french?'<span class="yes">✅ Oui</span>':'<span class="no">❌ Non</span>'}
-function actionCell(a){if(!a.arr_url)return '—';return '<a class="open" href="'+esc(a.arr_url)+'" target="_blank" rel="noopener">Ouvrir '+esc(a.arr_source||'Arr')+'</a>'}
-function filtered(rows){const f=document.getElementById('filter').value,q=document.getElementById('search').value.trim().toLowerCase();return rows.filter(a=>{if(f==='missing'&&(a.status==='error'||a.forced_french))return false;if(f==='forced'&&(!a.forced_french||a.status==='error'))return false;if(f==='error'&&a.status!=='error')return false;return !q||String(a.title||a.series_title||'').toLowerCase().includes(q)})}
-function renderResults(){const rows=filtered(allResults),films=rows.filter(a=>a.type==='Film'),series=rows.filter(a=>a.type==='Série');document.getElementById('filmResults').innerHTML=films.length?films.map(a=>'<tr><td>'+esc(a.title)+'</td><td>'+stateCell(a)+'</td><td>'+actionCell(a)+'</td></tr>').join(''):'<tr><td colspan="3" class="empty">Aucun résultat</td></tr>';document.getElementById('seriesResults').innerHTML=series.length?series.map(a=>'<tr><td>'+esc(a.series_title||a.title)+'</td><td>'+fmtSeason(a.season_number)+'</td><td>'+fmtEpisode(a.episode_number)+'</td><td>'+stateCell(a)+'</td><td>'+actionCell(a)+'</td></tr>').join(''):'<tr><td colspan="5" class="empty">Aucun résultat</td></tr>'}
-document.getElementById('filter').addEventListener('change',renderResults);document.getElementById('search').addEventListener('input',renderResults);
-async function loadResults(){const r=await api('/scan/results');allResults=r.results||[];renderResults();resultsLoaded=true}
-function scheduleRefresh(scanning){clearTimeout(refreshTimer);refreshTimer=setTimeout(refresh,scanning?5000:15000)}
-async function refresh(){try{const s=await api('/status');document.getElementById('service').textContent=s.status==='ok'?'● En ligne':'● Erreur';document.getElementById('qb').textContent=s.qbittorrent.status==='connected'?'● Connecté ('+(s.qbittorrent.torrents||0)+')':'● Indisponible';document.getElementById('discord').textContent=s.discord.status==='connected'?'● Connecté':s.discord.status==='connecting'?'● Connexion…':'● Indisponible';document.getElementById('radarr').textContent=s.libraries.radarr.configured?'● Configuré':'● Non configuré';document.getElementById('sonarr').textContent=s.libraries.sonarr.configured?'● Configuré':'● Non configuré';const x=await api('/scan/status');const pct=x.total_files?Math.round(x.processed_files/x.total_files*100):0;document.getElementById('bar').style.width=pct+'%';document.getElementById('scanLabel').textContent=x.running?('Scan en cours : '+pct+'%'+(x.current_file?' — '+x.current_file:'')):(x.finished_at?'Dernier scan terminé.':'Aucun scan en cours.');document.getElementById('scanStats').textContent='Analysés : '+x.processed_files+'/'+x.total_files+' • Avec FR Forced : '+x.files_with_forced_fr+' • Sans FR Forced : '+x.files_without_forced_fr+' • Erreurs : '+x.errors;if(!resultsLoaded||(previousScanRunning===true&&x.running===false))await loadResults();previousScanRunning=x.running;scheduleRefresh(x.running)}catch(e){console.error(e);scheduleRefresh(false)}}refresh();
-</script></body></html>"""
+const $=x=>document.getElementById(x);let data=[],prev=false,loaded=false,timer;
+async function api(u,o={}){const r=await fetch(u,o),d=await r.json();if(!r.ok)throw Error(d.detail||'Erreur');return d}
+function esc(v){return String(v??'').replace(/[&<>\"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#039;'}[c]))}
+function st(id,s,e=''){const m={connected:['● Connecté','ok'],connecting:['● Connexion…','warn'],disabled:['● Désactivé','warn'],error:['● Indisponible','bad'],not_configured:['● Non configuré','warn'],unknown:['● Inconnu','warn']}[s]||['● '+s,'warn'];$(id).textContent=m[0]+(e?' '+e:'');$(id).className='value '+m[1]}
+document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>{document.querySelectorAll('.tab').forEach(x=>x.classList.toggle('active',x===b));document.querySelectorAll('.panel').forEach(x=>x.classList.remove('active'));$('p-'+b.dataset.tab).classList.add('active');if(b.dataset.tab==='history')loadHistory()});
+document.querySelectorAll('.subtab').forEach(b=>b.onclick=()=>{document.querySelectorAll('.subtab').forEach(x=>x.classList.toggle('active',x===b));['films','series'].forEach(k=>$('k-'+k).style.display=k===b.dataset.kind?'block':'none')});
+async function startScan(s){try{await api('/scan/'+s,{method:'POST'});loaded=false;refresh()}catch(e){alert(e.message)}}
+function rows(kind){const f=$(kind==='films'?'ff':'sf').value,q=$(kind==='films'?'fs':'ss').value.toLowerCase();return data.filter(i=>(kind==='films'?i.type==='Film':i.type==='Série')).filter(i=>(f==='all'||f==='error'&&i.status==='error'||f==='yes'&&i.status!=='error'&&i.forced_french||f==='no'&&i.status!=='error'&&!i.forced_french)&&(!q||(i.title+' '+(i.season||'')+' '+(i.episode||'')).toLowerCase().includes(q)))}
+function badge(i){return i.status==='error'?'<span class="badge err">⚠ Erreur</span>':i.forced_french?'<span class="badge yes">✅ Oui</span>':'<span class="badge no">❌ Non</span>'}
+function render(kind){const r=rows(kind),t=$(kind);const cols=kind==='series'?5:3;t.innerHTML=r.length?r.map(i=>'<tr><td>'+esc(i.title)+'</td>'+(kind==='series'?'<td>'+esc(i.season||'—')+'</td><td>'+esc(i.episode||'—')+'</td>':'')+'<td>'+badge(i)+(i.error?'<div class="small">'+esc(i.error)+'</div>':'')+'</td><td>'+(i.arr_url?'<a class="btn" target="_blank" href="'+esc(i.arr_url)+'">Ouvrir '+esc(i.arr_source)+'</a>':'—')+'</td></tr>').join(''):'<tr><td colspan="'+cols+'" class="empty">Aucun résultat correspondant.</td></tr>'}
+async function loadResults(){data=(await api('/scan/results')).results||[];render('films');render('series');loaded=true}
+['ff','fs'].forEach(id=>$(id).oninput=()=>render('films'));['sf','ss'].forEach(id=>$(id).oninput=()=>render('series'));
+async function loadHistory(){const d=await api('/history');$('history').innerHTML=d.results.length?d.results.map(i=>'<tr><td>'+new Date(i.timestamp*1000).toLocaleString('fr-FR')+'</td><td>'+esc(i.torrent_name)+'</td><td>'+esc(i.result)+'</td><td>'+esc(i.details||'—')+'</td></tr>').join(''):'<tr><td colspan="4" class="empty">Aucune analyse depuis le démarrage.</td></tr>'}
+async function refresh(){try{const [s,x]=await Promise.all([api('/status'),api('/scan/status')]);st('qb',s.qbittorrent.status,s.qbittorrent.torrents!=null?'('+s.qbittorrent.torrents+')':'');st('discord',s.discord.status);st('radarr',s.radarr.status,s.radarr.version?'v'+s.radarr.version:'');st('sonarr',s.sonarr.status,s.sonarr.version?'v'+s.sonarr.version:'');const p=x.total_files?Math.round(x.processed_files/x.total_files*100):0;$('bar').style.width=p+'%';$('scanLabel').textContent=x.running?'Scan en cours : '+p+'%'+(x.current_file?' — '+x.current_file:''):(x.finished_at?'Dernier scan terminé.':'Aucun scan en cours.');$('stats').textContent='Analysés : '+x.processed_files+'/'+x.total_files+' • Avec FR Forced : '+x.files_with_forced_fr+' • Sans FR Forced : '+x.files_without_forced_fr+' • Erreurs : '+x.errors;if(!loaded||(prev&&!x.running))await loadResults();prev=x.running;clearTimeout(timer);timer=setTimeout(refresh,x.running?5000:15000)}catch(e){console.error(e);clearTimeout(timer);timer=setTimeout(refresh,15000)}}refresh();
+</script></main></body></html>"""
+
 
 @app.get("/status")
 def status() -> dict[str, Any]:
     qb_status, qb_count = _qbittorrent_status()
+    radarr_status = _arr_connection_status(RADARR_URL, RADARR_API_KEY)
+    sonarr_status = _arr_connection_status(SONARR_URL, SONARR_API_KEY)
 
     return {
         "status": "ok",
-        "version": "2.1.1",
+        "version": "2.1.0",
         "uptime_seconds": int(time.time() - SERVICE_STARTED_AT),
         "qbittorrent": {
             "status": qb_status,
@@ -2513,6 +2622,8 @@ def status() -> dict[str, Any]:
             "status": _discord_status(),
             "channel_id": DISCORD_CHANNEL_ID or None,
         },
+        "radarr": radarr_status,
+        "sonarr": sonarr_status,
         "monitoring": {
             "enabled": True,
             "poll_seconds": POLL_SECONDS,
@@ -2532,6 +2643,15 @@ def status() -> dict[str, Any]:
             "sonarr": {"configured": bool(SONARR_URL and SONARR_API_KEY), "url": SONARR_URL},
             "path_mappings_configured": len(ARR_PATH_MAPPINGS),
         },
+    }
+
+
+@app.get("/history")
+def history() -> dict[str, Any]:
+    return {
+        "results": list(analysis_history),
+        "persistent": False,
+        "storage": "memory",
     }
 
 
