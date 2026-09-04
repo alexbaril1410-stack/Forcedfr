@@ -94,7 +94,7 @@ log = logging.getLogger("forcedfr")
 app = FastAPI(
     title="ForcedFR",
     description="Détection automatique des pistes françaises forcées.",
-    version="2.2.0",
+    version="2.3.0",
 )
 
 
@@ -781,6 +781,14 @@ def build_discord_bot() -> Any:
                 return
 
             resolved_discord_actions.add(torrent_hash)
+
+            record_torrent_action(
+                torrent_hash,
+                action,
+                source="discord",
+                actor=str(interaction.user),
+                details=response_message,
+            )
 
             # Désactive les boutons de décision tout en conservant
             # les liens vers torrent / qBittorrent / Radarr-Sonarr.
@@ -2216,6 +2224,37 @@ def init_database() -> None:
             )
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_library_analysis_path ON library_analysis(path)")
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS torrent_analysis (
+                torrent_hash TEXT PRIMARY KEY,
+                torrent_name TEXT NOT NULL,
+                result TEXT NOT NULL,
+                details TEXT,
+                forced_french INTEGER,
+                first_detected_at REAL NOT NULL,
+                analyzed_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                last_action TEXT,
+                last_action_at REAL
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_torrent_analysis_analyzed_at ON torrent_analysis(analyzed_at DESC)")
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS torrent_actions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                torrent_hash TEXT NOT NULL,
+                action TEXT NOT NULL,
+                source TEXT NOT NULL,
+                actor TEXT,
+                details TEXT,
+                created_at REAL NOT NULL,
+                FOREIGN KEY (torrent_hash) REFERENCES torrent_analysis(torrent_hash)
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_torrent_actions_hash ON torrent_actions(torrent_hash)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_torrent_actions_created_at ON torrent_actions(created_at DESC)")
     log.info("SQLite initialisée : %s", SQLITE_PATH)
 
 
@@ -2264,9 +2303,18 @@ def _save_cached_analysis(item: dict[str, Any], file_path: Path, detection: dict
 
 init_database()
 
-# Historique qBittorrent : conservé en mémoire, indépendant du cache SQLite bibliothèque.
-analysis_history: list[dict[str, Any]] = []
+# ============================================================
+# SQLITE - HISTORIQUE PERSISTANT DES ANALYSES qBITTORRENT
+# ============================================================
 ANALYSIS_HISTORY_LIMIT = int(os.getenv("ANALYSIS_HISTORY_LIMIT", "500"))
+
+
+def _torrent_forced_value(result: str) -> int | None:
+    if result == "forced_found":
+        return 1
+    if result == "no_forced":
+        return 0
+    return None
 
 
 def record_analysis_history(
@@ -2275,14 +2323,66 @@ def record_analysis_history(
     result: str,
     details: str | None = None,
 ) -> None:
-    analysis_history.insert(0, {
-        "timestamp": time.time(),
-        "torrent_hash": torrent_hash,
-        "torrent_name": torrent_name,
-        "result": result,
-        "details": details,
-    })
-    del analysis_history[ANALYSIS_HISTORY_LIMIT:]
+    now = time.time()
+    forced_value = _torrent_forced_value(result)
+    with _db_connect() as conn:
+        conn.execute("""
+            INSERT INTO torrent_analysis
+            (torrent_hash, torrent_name, result, details, forced_french,
+             first_detected_at, analyzed_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(torrent_hash) DO UPDATE SET
+                torrent_name=excluded.torrent_name,
+                result=excluded.result,
+                details=excluded.details,
+                forced_french=COALESCE(excluded.forced_french, torrent_analysis.forced_french),
+                analyzed_at=excluded.analyzed_at,
+                updated_at=excluded.updated_at
+        """, (
+            torrent_hash, torrent_name, result, details, forced_value,
+            now, now, now,
+        ))
+        conn.execute("""
+            INSERT INTO torrent_actions
+            (torrent_hash, action, source, actor, details, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (torrent_hash, "analysis", "forcedfr", None, details or result, now))
+
+
+def record_torrent_action(
+    torrent_hash: str,
+    action: str,
+    *,
+    source: str,
+    actor: str | None = None,
+    details: str | None = None,
+) -> None:
+    now = time.time()
+    with _db_connect() as conn:
+        conn.execute("""
+            INSERT INTO torrent_actions
+            (torrent_hash, action, source, actor, details, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (torrent_hash, action, source, actor, details, now))
+        conn.execute("""
+            UPDATE torrent_analysis
+            SET last_action=?, last_action_at=?, updated_at=?
+            WHERE torrent_hash=?
+        """, (action, now, now, torrent_hash))
+
+
+def get_analysis_history(limit: int | None = None) -> list[dict[str, Any]]:
+    history_limit = max(1, min(int(limit or ANALYSIS_HISTORY_LIMIT), 5000))
+    with _db_connect() as conn:
+        rows = conn.execute("""
+            SELECT torrent_hash, torrent_name, result, details,
+                   analyzed_at AS timestamp, forced_french,
+                   last_action, last_action_at
+            FROM torrent_analysis
+            ORDER BY analyzed_at DESC
+            LIMIT ?
+        """, (history_limit,)).fetchall()
+    return [dict(row) for row in rows]
 
 
 scan_lock = threading.Lock()
@@ -2649,7 +2749,7 @@ def _qbittorrent_status() -> tuple[str, int | None]:
 def web_dashboard() -> str:
     return """<!doctype html>
 <html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ForcedFR v2.2.0</title>
+<title>ForcedFR v2.3.0</title>
 <style>
 :root{color-scheme:dark;--bg:#0d1117;--p:#161b22;--b:#30363d;--m:#8b949e;--t:#e6edf3;--g:#3fb950;--y:#d29922;--r:#f85149;font-family:Inter,system-ui,sans-serif}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--t)}main{max-width:1320px;margin:auto;padding:28px}h1{margin:0}.sub,.small{color:var(--m)}
@@ -2663,7 +2763,7 @@ select,input{background:#0f141b;color:white;border:1px solid var(--b);border-rad
 .badge{font-weight:700}.yes{color:var(--g)}.no{color:var(--r)}.err{color:var(--y)}a.btn{background:#1f6feb;color:white;text-decoration:none;padding:7px 10px;border-radius:7px;font-size:.82rem}
 .empty{color:var(--m);text-align:center;padding:22px}@media(max-width:700px){main{padding:16px}}
 </style></head><body><main>
-<h1>ForcedFR <span class="small">v2.2.0</span></h1><p class="sub">Surveillance qBittorrent et contrôle des bibliothèques Radarr / Sonarr.</p>
+<h1>ForcedFR <span class="small">v2.3.0</span></h1><p class="sub">Surveillance qBittorrent et contrôle des bibliothèques Radarr / Sonarr.</p>
 <div class="grid">
 <div class="card"><div class="label">ForcedFR</div><div class="value ok">● En ligne</div></div>
 <div class="card"><div class="label">qBittorrent</div><div class="value" id="qb">…</div></div>
@@ -2671,7 +2771,7 @@ select,input{background:#0f141b;color:white;border:1px solid var(--b);border-rad
 <div class="card"><div class="label">Radarr</div><div class="value" id="radarr">…</div></div>
 <div class="card"><div class="label">Sonarr</div><div class="value" id="sonarr">…</div></div></div>
 
-<div class="tabs"><button class="tab active" data-tab="scan">🔍 Scan de bibliothèque</button><button class="tab" data-tab="history">📜 Historique qBittorrent</button></div>
+<div class="tabs"><button class="tab active" data-tab="scan">🔍 Scan de bibliothèque</button><button class="tab" data-tab="history">📜 Historique des analyses</button></div>
 
 <section id="p-scan" class="panel active">
 <div class="card"><div class="toolbar"><button onclick="startScan('films','incremental')">⚡ Films incrémental</button><button onclick="startScan('films','full')">🎬 Films complet</button><button onclick="startScan('series','incremental')">⚡ Séries incrémental</button><button onclick="startScan('series','full')">📺 Séries complet</button><button onclick="startScan('all','incremental')">⚡ Toute la bibliothèque</button></div>
@@ -2685,7 +2785,7 @@ select,input{background:#0f141b;color:white;border:1px solid var(--b);border-rad
 <div class="tablewrap"><table><thead><tr><th>Série</th><th>Saison</th><th>Épisode</th><th>Forced FR</th><th>Action</th></tr></thead><tbody id="series"></tbody></table></div></div>
 </section>
 
-<section id="p-history" class="panel"><h2>Historique des analyses qBittorrent</h2><p class="sub">Historique mémoire, préparé pour une future migration SQLite.</p>
+<section id="p-history" class="panel"><h2>Historique des analyses</h2><p class="sub">Historique persistant des analyses et décisions prises sur les téléchargements.</p>
 <div class="tablewrap"><table><thead><tr><th>Date</th><th>Torrent</th><th>Résultat</th><th>Détails</th></tr></thead><tbody id="history"></tbody></table></div></section>
 
 <script>
@@ -2701,7 +2801,7 @@ function badge(i){return i.status==='error'?'<span class="badge err">⚠ Erreur<
 function render(kind){const r=rows(kind),t=$(kind);const cols=kind==='series'?5:3;t.innerHTML=r.length?r.map(i=>'<tr><td>'+esc(i.title)+'</td>'+(kind==='series'?'<td>'+esc(i.season||'—')+'</td><td>'+esc(i.episode||'—')+'</td>':'')+'<td>'+badge(i)+(i.error?'<div class="small">'+esc(i.error)+'</div>':'')+'</td><td>'+(i.arr_url?'<a class="btn" target="_blank" href="'+esc(i.arr_url)+'">Ouvrir '+esc(i.arr_source)+'</a>':'—')+'</td></tr>').join(''):'<tr><td colspan="'+cols+'" class="empty">Aucun résultat correspondant.</td></tr>'}
 async function loadResults(){data=(await api('/scan/results')).results||[];render('films');render('series');loaded=true}
 ['ff','fs'].forEach(id=>$(id).oninput=()=>render('films'));['sf','ss'].forEach(id=>$(id).oninput=()=>render('series'));
-async function loadHistory(){const d=await api('/history');$('history').innerHTML=d.results.length?d.results.map(i=>'<tr><td>'+new Date(i.timestamp*1000).toLocaleString('fr-FR')+'</td><td>'+esc(i.torrent_name)+'</td><td>'+esc(i.result)+'</td><td>'+esc(i.details||'—')+'</td></tr>').join(''):'<tr><td colspan="4" class="empty">Aucune analyse depuis le démarrage.</td></tr>'}
+async function loadHistory(){const d=await api('/history');$('history').innerHTML=d.results.length?d.results.map(i=>'<tr><td>'+new Date(i.timestamp*1000).toLocaleString('fr-FR')+'</td><td>'+esc(i.torrent_name)+'</td><td>'+esc(i.result)+'</td><td>'+esc(i.details||'—')+'</td></tr>').join(''):'<tr><td colspan="4" class="empty">Aucune analyse enregistrée.</td></tr>'}
 async function refresh(){try{const [s,x]=await Promise.all([api('/status'),api('/scan/status')]);st('qb',s.qbittorrent.status,s.qbittorrent.torrents!=null?'('+s.qbittorrent.torrents+')':'');st('discord',s.discord.status);st('radarr',s.radarr.status,s.radarr.version?'v'+s.radarr.version:'');st('sonarr',s.sonarr.status,s.sonarr.version?'v'+s.sonarr.version:'');const p=x.total_files?Math.round(x.processed_files/x.total_files*100):0;$('bar').style.width=p+'%';$('scanLabel').textContent=x.running?'Scan en cours : '+p+'%'+(x.current_file?' — '+x.current_file:''):(x.finished_at?'Dernier scan terminé.':'Aucun scan en cours.');$('stats').textContent='Analysés : '+x.processed_files+'/'+x.total_files+' • Avec FR Forced : '+x.files_with_forced_fr+' • Sans FR Forced : '+x.files_without_forced_fr+' • Cache : '+(x.cache_hits||0)+' • FFprobe : '+(x.reanalyzed||0)+' • Erreurs : '+x.errors;if(!loaded||(prev&&!x.running))await loadResults();prev=x.running;clearTimeout(timer);timer=setTimeout(refresh,x.running?5000:15000)}catch(e){console.error(e);clearTimeout(timer);timer=setTimeout(refresh,15000)}}refresh();
 </script></main></body></html>"""
 
@@ -2752,9 +2852,9 @@ def status() -> dict[str, Any]:
 @app.get("/history")
 def history() -> dict[str, Any]:
     return {
-        "results": list(analysis_history),
-        "persistent": False,
-        "storage": "memory",
+        "results": get_analysis_history(),
+        "persistent": True,
+        "storage": "sqlite",
     }
 
 
