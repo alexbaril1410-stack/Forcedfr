@@ -10,7 +10,12 @@ from typing import Any
 
 import requests
 from fastapi import FastAPI, HTTPException
+
 from fastapi.responses import HTMLResponse
+
+# Désactive uniquement les logs d'accès HTTP Uvicorn répétitifs.
+# Les logs applicatifs ForcedFR restent inchangés.
+logging.getLogger("uvicorn.access").disabled = True
 
 try:
     import discord
@@ -85,7 +90,7 @@ log = logging.getLogger("forcedfr")
 app = FastAPI(
     title="ForcedFR",
     description="Détection automatique des pistes françaises forcées.",
-    version="2.0.0",
+    version="2.0.1",
 )
 
 
@@ -1984,7 +1989,7 @@ def health() -> dict[str, Any]:
 
     return {
         "status": "ok",
-        "version": "2.0.0",
+        "version": "2.0.1",
         "qbittorrent": QB_HOST,
         "monitoring": True,
         "poll_seconds": POLL_SECONDS,
@@ -2135,13 +2140,75 @@ def resume(
 # V2.0 — INTERFACE WEB ET SCAN DE BIBLIOTHÈQUE
 # ============================================================
 
-LIBRARY_FILMS_PATH = Path(
-    os.getenv("LIBRARY_FILMS_PATH", "/data/Films")
-)
+# Les bibliothèques sont découvertes automatiquement à partir des volumes
+# réellement montés dans le conteneur sous /data. Aucun chemin média n'est
+# figé dans le code : une modification du Docker Compose est automatiquement
+# prise en compte au prochain redémarrage du conteneur.
+SCAN_ROOT = Path(os.getenv("SCAN_ROOT", "/data"))
 
-LIBRARY_SERIES_PATH = Path(
-    os.getenv("LIBRARY_SERIES_PATH", "/data/Séries")
-)
+
+def discover_scan_volumes() -> list[Path]:
+    """
+    Retourne les points de montage directement accessibles sous /data.
+
+    Exemple avec le Docker Compose actuel :
+      /data/Téléchargements
+      /data/Films
+      /data/Séries
+      /data/Seed
+      /data/Seedb
+
+    Les sous-montages sont conservés comme volumes distincts afin que tous les
+    volumes déclarés dans Docker Compose puissent être parcourus.
+    """
+    volumes: list[Path] = []
+
+    try:
+        mountinfo = Path("/proc/self/mountinfo").read_text(
+            encoding="utf-8",
+            errors="ignore",
+        )
+
+        for line in mountinfo.splitlines():
+            parts = line.split(" - ", 1)[0].split()
+            if len(parts) < 5:
+                continue
+
+            mount_point = parts[4].replace(r"\040", " ")
+            path = Path(mount_point)
+
+            try:
+                path.relative_to(SCAN_ROOT)
+            except ValueError:
+                continue
+
+            if path == SCAN_ROOT or not path.exists() or not path.is_dir():
+                continue
+
+            volumes.append(path)
+
+    except Exception as exc:
+        log.warning(
+            "[SCAN] Impossible de lire les volumes Docker : %s",
+            exc,
+        )
+
+    # Fallback utile si mountinfo n'est pas disponible.
+    if not volumes and SCAN_ROOT.exists():
+        volumes = [
+            path
+            for path in SCAN_ROOT.iterdir()
+            if path.is_dir()
+        ]
+
+    return sorted(set(volumes), key=lambda p: str(p))
+
+
+def _volume_label(path: Path) -> str:
+    try:
+        return str(path.relative_to(SCAN_ROOT))
+    except ValueError:
+        return path.name
 
 SERVICE_STARTED_AT = time.time()
 
@@ -2175,6 +2242,7 @@ def _scan_reset(scope: str) -> None:
             "files_with_forced_fr": 0,
             "files_without_forced_fr": 0,
             "errors": 0,
+            "duplicates_skipped": 0,
             "results": [],
             "last_error": None,
         }
@@ -2182,38 +2250,86 @@ def _scan_reset(scope: str) -> None:
 
 
 def _scan_roots(scope: str) -> list[Path]:
-    if scope == "films":
-        return [LIBRARY_FILMS_PATH]
-    if scope == "series":
-        return [LIBRARY_SERIES_PATH]
+    volumes = discover_scan_volumes()
+
     if scope == "all":
-        return [LIBRARY_FILMS_PATH, LIBRARY_SERIES_PATH]
-    raise ValueError("Scope de scan invalide.")
+        return volumes
+
+    # Les actions Films et Séries restent disponibles pour l'interface,
+    # mais sont résolues dynamiquement selon le nom des volumes montés.
+    normalized = scope.lower()
+
+    aliases = {
+        "films": ("films", "film", "movies", "movie"),
+        "series": ("series", "séries", "tv", "shows", "show"),
+    }
+
+    accepted = aliases.get(normalized, (normalized,))
+    selected = [
+        path
+        for path in volumes
+        if path.name.lower() in accepted
+    ]
+
+    return selected
 
 
 def _library_kind(file_path: Path) -> str:
-    try:
-        if file_path.is_relative_to(LIBRARY_FILMS_PATH):
-            return "film"
-        if file_path.is_relative_to(LIBRARY_SERIES_PATH):
-            return "serie"
-    except AttributeError:
-        path_text = str(file_path)
-        if path_text.startswith(str(LIBRARY_FILMS_PATH)):
-            return "film"
-        if path_text.startswith(str(LIBRARY_SERIES_PATH)):
-            return "serie"
+    name = file_path.name.lower()
+
+    # Le type est déterminé à partir du premier volume parent trouvé.
+    for volume in discover_scan_volumes():
+        try:
+            file_path.relative_to(volume)
+            volume_name = volume.name.lower()
+
+            if volume_name in ("films", "film", "movies", "movie"):
+                return "film"
+
+            if volume_name in ("series", "séries", "tv", "shows", "show"):
+                return "serie"
+
+            return volume.name
+        except ValueError:
+            continue
+
     return "inconnu"
 
 
 def _relative_library_path(file_path: Path) -> str:
-    for root in (LIBRARY_FILMS_PATH, LIBRARY_SERIES_PATH):
+    for root in discover_scan_volumes():
         try:
-            return str(file_path.relative_to(root))
+            return f"{_volume_label(root)}/{file_path.relative_to(root)}"
         except ValueError:
             pass
+
     return str(file_path)
 
+
+def _media_signature(file_path: Path) -> tuple[str, int] | None:
+    """
+    Signature légère pour éviter d'analyser deux fois le même média présent
+    dans plusieurs volumes (ex. Téléchargements puis Films via Radarr).
+
+    On utilise nom de fichier + taille. Cela évite un hash complet très coûteux
+    sur de gros fichiers vidéo et limite fortement les doublons classiques.
+    """
+    try:
+        stat = file_path.stat()
+        return (file_path.name.casefold(), stat.st_size)
+    except OSError:
+        return None
+
+
+def _inode_signature(file_path: Path) -> tuple[int, int] | None:
+    """
+    Détection exacte des hardlinks / mêmes fichiers physiques.
+    """
+    try:
+        stat = file_path.stat()
+        return (stat.st_dev, stat.st_ino)
+    except OSError:
+        return None
 
 def run_library_scan(scope: str) -> None:
     if not scan_lock.acquire(blocking=False):
@@ -2225,26 +2341,48 @@ def run_library_scan(scope: str) -> None:
         roots = _scan_roots(scope)
 
         files: list[Path] = []
+        seen_inodes: set[tuple[int, int]] = set()
+        seen_media: set[tuple[str, int]] = set()
 
         for root in roots:
             if not root.exists():
-                log.warning("Bibliothèque introuvable : %s", root)
+                log.warning("Volume introuvable : %s", root)
                 continue
 
-            files.extend(
-                sorted(
-                    path
-                    for path in root.rglob("*")
-                    if path.is_file() and path.suffix.lower() == ".mkv"
-                )
-            )
+            for path in sorted(root.rglob("*")):
+                if not path.is_file() or path.suffix.lower() != ".mkv":
+                    continue
+
+                inode_signature = _inode_signature(path)
+                media_signature = _media_signature(path)
+
+                # Même fichier physique (hardlink / bind visible plusieurs fois).
+                if inode_signature and inode_signature in seen_inodes:
+                    scan_state["duplicates_skipped"] += 1
+                    continue
+
+                # Même nom + même taille dans plusieurs volumes :
+                # cas classique Téléchargements -> Films/Séries.
+                if media_signature and media_signature in seen_media:
+                    scan_state["duplicates_skipped"] += 1
+                    continue
+
+                if inode_signature:
+                    seen_inodes.add(inode_signature)
+
+                if media_signature:
+                    seen_media.add(media_signature)
+
+                files.append(path)
 
         scan_state["total_files"] = len(files)
 
         log.info(
-            "[SCAN] Démarrage du scan '%s' : %d MKV détecté(s).",
+            "[SCAN] Démarrage du scan '%s' : %d MKV unique(s), %d doublon(s) ignoré(s), %d volume(s).",
             scope,
             len(files),
+            scan_state["duplicates_skipped"],
+            len(roots),
         )
 
         for file_path in files:
@@ -2297,9 +2435,10 @@ def run_library_scan(scope: str) -> None:
                 scan_state["processed_files"] += 1
 
         log.info(
-            "[SCAN] Terminé : %d analysé(s), %d sans FR Forced, %d erreur(s).",
+            "[SCAN] Terminé : %d analysé(s), %d sans FR Forced, %d doublon(s) ignoré(s), %d erreur(s).",
             scan_state["processed_files"],
             scan_state["files_without_forced_fr"],
+            scan_state.get("duplicates_skipped", 0),
             scan_state["errors"],
         )
 
@@ -2382,7 +2521,7 @@ th,td{text-align:left;padding:12px;border-bottom:1px solid #30363d;font-size:.9r
 </head>
 <body>
 <main>
-<h1>ForcedFR <span class="small">v2.0.0</span></h1>
+<h1>ForcedFR <span class="small">v2.0.1</span></h1>
 <p class="sub">Surveillance des torrents et contrôle de la bibliothèque média.</p>
 
 <div class="grid">
@@ -2418,8 +2557,24 @@ th,td{text-align:left;padding:12px;border-bottom:1px solid #30363d;font-size:.9r
 
 <script>
 async function api(url,opt={}){const r=await fetch(url,opt);const d=await r.json();if(!r.ok)throw new Error(d.detail||'Erreur API');return d}
-async function scan(scope){try{await api('/scan/'+scope,{method:'POST'});refresh()}catch(e){alert(e.message)}}
+async function scan(scope){try{resultsLoaded=false;await api('/scan/'+scope,{method:'POST'});clearTimeout(refreshTimer);refresh()}catch(e){alert(e.message)}}
 function esc(v){return String(v||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[c]))}
+let refreshTimer=null;
+let previousScanRunning=null;
+let resultsLoaded=false;
+
+async function loadResults(){
+ const r=await api('/scan/results');
+ const rows=r.results||[];
+ document.getElementById('results').innerHTML=rows.length?rows.map(a=>'<tr><td>'+esc(a.type)+'</td><td class="path">'+esc(a.relative_path)+'</td><td class="'+(a.status==='error'?'bad':'warn')+'">'+(a.status==='error'?'Erreur : '+esc(a.error):'Pas de FR Forced')+'</td></tr>').join(''):'<tr><td colspan="3">Aucun fichier problématique détecté.</td></tr>';
+ resultsLoaded=true;
+}
+
+function scheduleRefresh(isScanning){
+ clearTimeout(refreshTimer);
+ refreshTimer=setTimeout(refresh,isScanning?5000:15000);
+}
+
 async function refresh(){
  try{
   const s=await api('/status');
@@ -2427,17 +2582,27 @@ async function refresh(){
   document.getElementById('qb').textContent=s.qbittorrent.status==='connected'?'● Connecté ('+(s.qbittorrent.torrents||0)+')':'● Indisponible';
   document.getElementById('discord').textContent=s.discord.status;
   document.getElementById('processing').textContent=s.monitoring.processing_torrents;
+
   const x=await api('/scan/status');
   const pct=x.total_files?Math.round((x.processed_files/x.total_files)*100):0;
   document.getElementById('bar').style.width=pct+'%';
   document.getElementById('scanLabel').textContent=x.running?('Scan en cours : '+pct+'%'+(x.current_file?' — '+x.current_file:'' )):(x.finished_at?'Dernier scan terminé.':'Aucun scan en cours.');
-  document.getElementById('scanStats').textContent='Analysés : '+x.processed_files+'/'+x.total_files+' • Avec FR Forced : '+x.files_with_forced_fr+' • Sans FR Forced : '+x.files_without_forced_fr+' • Erreurs : '+x.errors;
-  const r=await api('/scan/results');
-  const rows=r.results||[];
-  document.getElementById('results').innerHTML=rows.length?rows.map(a=>'<tr><td>'+esc(a.type)+'</td><td class="path">'+esc(a.relative_path)+'</td><td class="'+(a.status==='error'?'bad':'warn')+'">'+(a.status==='error'?'Erreur : '+esc(a.error):'Pas de FR Forced')+'</td></tr>').join(''):'<tr><td colspan="3">Aucun fichier problématique détecté.</td></tr>';
- }catch(e){console.error(e)}
+  document.getElementById('scanStats').textContent='Analysés : '+x.processed_files+'/'+x.total_files+' • Avec FR Forced : '+x.files_with_forced_fr+' • Sans FR Forced : '+x.files_without_forced_fr+' • Doublons ignorés : '+(x.duplicates_skipped||0)+' • Erreurs : '+x.errors;
+
+  // Les résultats ne sont récupérés qu'au chargement initial et à la fin d'un scan.
+  if(!resultsLoaded || (previousScanRunning===true && x.running===false)){
+    await loadResults();
+  }
+
+  previousScanRunning=x.running;
+  scheduleRefresh(x.running);
+ }catch(e){
+  console.error(e);
+  scheduleRefresh(false);
+ }
 }
-refresh();setInterval(refresh,3000);
+
+refresh();
 </script>
 </body></html>"""
 
@@ -2448,7 +2613,7 @@ def status() -> dict[str, Any]:
 
     return {
         "status": "ok",
-        "version": "2.0.0",
+        "version": "2.0.1",
         "uptime_seconds": int(time.time() - SERVICE_STARTED_AT),
         "qbittorrent": {
             "status": qb_status,
@@ -2470,10 +2635,17 @@ def status() -> dict[str, Any]:
             "scope": scan_state.get("requested_scope"),
             "processed_files": scan_state.get("processed_files", 0),
             "total_files": scan_state.get("total_files", 0),
+            "duplicates_skipped": scan_state.get("duplicates_skipped", 0),
         },
         "libraries": {
-            "films": str(LIBRARY_FILMS_PATH),
-            "series": str(LIBRARY_SERIES_PATH),
+            "scan_root": str(SCAN_ROOT),
+            "volumes": [
+                {
+                    "name": _volume_label(volume),
+                    "path": str(volume),
+                }
+                for volume in discover_scan_volumes()
+            ],
         },
     }
 
