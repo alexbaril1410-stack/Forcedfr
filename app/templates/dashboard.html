@@ -1,1 +1,308 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
 
+    <title>ForcedFR</title>
+
+    <link rel="stylesheet" href="{{ url_for('static', path='style.css') }}">
+</head>
+
+<body>
+
+<div class="app">
+
+    <!-- HEADER -->
+    <header class="header">
+
+        <div class="brand">
+            <div class="logo">FF</div>
+
+            <div>
+                <h1>ForcedFR</h1>
+                <span>Contrôle automatique des sous-titres forcés</span>
+            </div>
+        </div>
+
+        <div class="version">
+            v2.0.0
+        </div>
+
+    </header>
+
+
+    <!-- NAVIGATION -->
+    <nav class="navigation">
+
+        <a href="/" class="nav-item active">
+            🏠 Dashboard
+        </a>
+
+        <a href="#" class="nav-item">
+            🎬 Films
+        </a>
+
+        <a href="#" class="nav-item">
+            📺 Séries
+        </a>
+
+        <a href="#" class="nav-item">
+            📜 Historique
+        </a>
+
+    </nav>
+
+
+    <!-- MAIN -->
+    <main class="content">
+
+        <!-- TITLE -->
+        <section class="page-title">
+
+            <div>
+                <h2>Tableau de bord</h2>
+                <p>Vue d'ensemble du système ForcedFR.</p>
+            </div>
+
+            <div class="status-online">
+                <span class="status-dot"></span>
+                Service actif
+            </div>
+
+        </section>
+
+
+        <!-- SYSTEM STATUS -->
+        <section>
+
+            <h3>État du système</h3>
+
+            <div class="status-grid">
+
+                <div class="status-card">
+
+                    <div class="status-icon">⬇️</div>
+
+                    <div class="status-info">
+                        <span>qBittorrent</span>
+                        <strong id="qb-status">
+                            Vérification...
+                        </strong>
+                    </div>
+
+                </div>
+
+
+                <div class="status-card">
+
+                    <div class="status-icon">🤖</div>
+
+                    <div class="status-info">
+                        <span>Bot Discord</span>
+                        <strong id="discord-status">
+                            Vérification...
+                        </strong>
+                    </div>
+
+                </div>
+
+
+                <div class="status-card">
+
+                    <div class="status-icon">🔎</div>
+
+                    <div class="status-info">
+                        <span>Surveillance</span>
+                        <strong id="monitor-status">
+                            Active
+                        </strong>
+                    </div>
+
+                </div>
+
+            </div>
+
+        </section>
+
+
+        <!-- STATISTICS -->
+        <section class="statistics">
+
+            <h3>Statistiques</h3>
+
+            <div class="stats-grid">
+
+                <div class="stat-card">
+                    <span class="stat-value">—</span>
+                    <span class="stat-label">Analyses effectuées</span>
+                </div>
+
+                <div class="stat-card">
+                    <span class="stat-value">—</span>
+                    <span class="stat-label">FR Forced détectés</span>
+                </div>
+
+                <div class="stat-card warning">
+                    <span class="stat-value">—</span>
+                    <span class="stat-label">Sans FR Forced</span>
+                </div>
+
+                <div class="stat-card">
+                    <span class="stat-value">—</span>
+                    <span class="stat-label">En attente</span>
+                </div>
+
+            </div>
+
+        </section>
+
+
+        <!-- LIBRARY SCANNER -->
+        <section class="scanner-section">
+
+            <div class="section-header">
+
+                <div>
+                    <h3>Scanner la bibliothèque</h3>
+
+                    <p>
+                        Analysez votre médiathèque existante afin d'identifier
+                        les films et épisodes ne possédant pas de sous-titre
+                        français forcé.
+                    </p>
+                </div>
+
+            </div>
+
+
+            <div class="scanner-grid">
+
+                <!-- MOVIES -->
+
+                <div class="scanner-card">
+
+                    <div class="scanner-icon">
+                        🎬
+                    </div>
+
+                    <h3>Films</h3>
+
+                    <p>
+                        Analyse complète de la bibliothèque Radarr.
+                    </p>
+
+                    <button class="scan-button disabled">
+                        Scanner les films
+                    </button>
+
+                    <small>
+                        Fonctionnalité prochainement disponible
+                    </small>
+
+                </div>
+
+
+                <!-- SERIES -->
+
+                <div class="scanner-card">
+
+                    <div class="scanner-icon">
+                        📺
+                    </div>
+
+                    <h3>Séries</h3>
+
+                    <p>
+                        Analyse complète des épisodes Sonarr.
+                    </p>
+
+                    <button class="scan-button disabled">
+                        Scanner les séries
+                    </button>
+
+                    <small>
+                        Fonctionnalité prochainement disponible
+                    </small>
+
+                </div>
+
+            </div>
+
+        </section>
+
+
+        <!-- INFO -->
+
+        <section class="info-box">
+
+            <div class="info-icon">
+                ℹ️
+            </div>
+
+            <div>
+                <strong>ForcedFR v2.0</strong>
+
+                <p>
+                    Le tableau de bord est actuellement en cours de développement.
+                    Les prochaines versions permettront de scanner automatiquement
+                    vos bibliothèques Radarr et Sonarr.
+                </p>
+            </div>
+
+        </section>
+
+    </main>
+
+</div>
+
+
+<script>
+
+async function refreshStatus() {
+
+    try {
+
+        const response = await fetch("/api/status");
+
+        if (!response.ok) {
+            throw new Error("Erreur API");
+        }
+
+        const data = await response.json();
+
+
+        document.getElementById("qb-status").textContent =
+            data.qbittorrent ? "Connecté" : "Déconnecté";
+
+
+        document.getElementById("discord-status").textContent =
+            data.discord ? "Connecté" : "Déconnecté";
+
+
+        document.getElementById("monitor-status").textContent =
+            data.monitoring ? "Active" : "Inactive";
+
+    }
+
+    catch (error) {
+
+        document.getElementById("qb-status").textContent =
+            "Indisponible";
+
+        document.getElementById("discord-status").textContent =
+            "Indisponible";
+
+    }
+
+}
+
+
+refreshStatus();
+
+setInterval(refreshStatus, 10000);
+
+</script>
+
+</body>
+</html>
