@@ -1989,7 +1989,7 @@ def health() -> dict[str, Any]:
 
     return {
         "status": "ok",
-        "version": "2.0.1",
+        "version": "2.1.0",
         "qbittorrent": QB_HOST,
         "monitoring": True,
         "poll_seconds": POLL_SECONDS,
@@ -2137,79 +2137,36 @@ def resume(
         )
 
 # ============================================================
-# V2.0 — INTERFACE WEB ET SCAN DE BIBLIOTHÈQUE
+# ============================================================
+# V2.1 — SCAN DE BIBLIOTHÈQUE VIA RADARR / SONARR
 # ============================================================
 
-# Les bibliothèques sont découvertes automatiquement à partir des volumes
-# réellement montés dans le conteneur sous /data. Aucun chemin média n'est
-# figé dans le code : une modification du Docker Compose est automatiquement
-# prise en compte au prochain redémarrage du conteneur.
-SCAN_ROOT = Path(os.getenv("SCAN_ROOT", "/data"))
+# Le scan de bibliothèque ne parcourt plus les volumes Docker. Radarr et Sonarr
+# sont les sources de vérité : seuls les médias réellement connus par les *Arr
+# sont proposés à FFprobe.
+#
+# Si les chemins renvoyés par Radarr/Sonarr ne correspondent pas directement aux
+# chemins visibles dans le conteneur ForcedFR, un remappage optionnel peut être
+# défini via ARR_PATH_MAPPINGS, au format JSON :
+# {"/movies":"/data/Films", "/tv":"/data/Séries"}
+ARR_PATH_MAPPINGS_RAW = os.getenv("ARR_PATH_MAPPINGS", "").strip()
 
 
-def discover_scan_volumes() -> list[Path]:
-    """
-    Retourne les points de montage directement accessibles sous /data.
-
-    Exemple avec le Docker Compose actuel :
-      /data/Téléchargements
-      /data/Films
-      /data/Séries
-      /data/Seed
-      /data/Seedb
-
-    Les sous-montages sont conservés comme volumes distincts afin que tous les
-    volumes déclarés dans Docker Compose puissent être parcourus.
-    """
-    volumes: list[Path] = []
-
+def _load_arr_path_mappings() -> list[tuple[str, str]]:
+    if not ARR_PATH_MAPPINGS_RAW:
+        return []
     try:
-        mountinfo = Path("/proc/self/mountinfo").read_text(
-            encoding="utf-8",
-            errors="ignore",
-        )
-
-        for line in mountinfo.splitlines():
-            parts = line.split(" - ", 1)[0].split()
-            if len(parts) < 5:
-                continue
-
-            mount_point = parts[4].replace(r"\040", " ")
-            path = Path(mount_point)
-
-            try:
-                path.relative_to(SCAN_ROOT)
-            except ValueError:
-                continue
-
-            if path == SCAN_ROOT or not path.exists() or not path.is_dir():
-                continue
-
-            volumes.append(path)
-
+        data = json.loads(ARR_PATH_MAPPINGS_RAW)
+        if not isinstance(data, dict):
+            raise ValueError("ARR_PATH_MAPPINGS doit être un objet JSON")
+        mappings = [(str(k).rstrip("/"), str(v).rstrip("/")) for k, v in data.items()]
+        return sorted(mappings, key=lambda x: len(x[0]), reverse=True)
     except Exception as exc:
-        log.warning(
-            "[SCAN] Impossible de lire les volumes Docker : %s",
-            exc,
-        )
-
-    # Fallback utile si mountinfo n'est pas disponible.
-    if not volumes and SCAN_ROOT.exists():
-        volumes = [
-            path
-            for path in SCAN_ROOT.iterdir()
-            if path.is_dir()
-        ]
-
-    return sorted(set(volumes), key=lambda p: str(p))
+        log.warning("[SCAN] ARR_PATH_MAPPINGS invalide : %s", exc)
+        return []
 
 
-def _volume_label(path: Path) -> str:
-    try:
-        return str(path.relative_to(SCAN_ROOT))
-    except ValueError:
-        return path.name
-
+ARR_PATH_MAPPINGS = _load_arr_path_mappings()
 SERVICE_STARTED_AT = time.time()
 
 scan_lock = threading.Lock()
@@ -2230,222 +2187,183 @@ scan_state: dict[str, Any] = {
 
 
 def _scan_reset(scope: str) -> None:
-    scan_state.update(
-        {
-            "running": True,
-            "requested_scope": scope,
-            "started_at": time.time(),
-            "finished_at": None,
-            "current_file": None,
-            "total_files": 0,
-            "processed_files": 0,
-            "files_with_forced_fr": 0,
-            "files_without_forced_fr": 0,
-            "errors": 0,
-            "duplicates_skipped": 0,
-            "results": [],
-            "last_error": None,
-        }
+    scan_state.update({
+        "running": True,
+        "requested_scope": scope,
+        "started_at": time.time(),
+        "finished_at": None,
+        "current_file": None,
+        "total_files": 0,
+        "processed_files": 0,
+        "files_with_forced_fr": 0,
+        "files_without_forced_fr": 0,
+        "errors": 0,
+        "results": [],
+        "last_error": None,
+    })
+
+
+def _arr_headers(api_key: str) -> dict[str, str]:
+    return {"X-Api-Key": api_key, "Accept": "application/json"}
+
+
+def _arr_request(base_url: str, api_key: str, endpoint: str, params: dict[str, Any] | None = None) -> Any:
+    if not base_url or not api_key:
+        raise RuntimeError("URL ou clé API Arr non configurée")
+    response = requests.get(
+        f"{base_url}/api/v3/{endpoint.lstrip('/')}",
+        headers=_arr_headers(api_key),
+        params=params,
+        timeout=30,
     )
+    response.raise_for_status()
+    return response.json()
 
 
-def _scan_roots(scope: str) -> list[Path]:
-    volumes = discover_scan_volumes()
-
-    if scope == "all":
-        return volumes
-
-    # Les actions Films et Séries restent disponibles pour l'interface,
-    # mais sont résolues dynamiquement selon le nom des volumes montés.
-    normalized = scope.lower()
-
-    aliases = {
-        "films": ("films", "film", "movies", "movie"),
-        "series": ("series", "séries", "tv", "shows", "show"),
-    }
-
-    accepted = aliases.get(normalized, (normalized,))
-    selected = [
-        path
-        for path in volumes
-        if path.name.lower() in accepted
-    ]
-
-    return selected
+def _resolve_arr_media_path(raw_path: str | None) -> Path | None:
+    if not raw_path:
+        return None
+    candidate = Path(raw_path)
+    if candidate.exists():
+        return candidate
+    raw = str(raw_path).rstrip("/")
+    for source_prefix, target_prefix in ARR_PATH_MAPPINGS:
+        if raw == source_prefix or raw.startswith(source_prefix + "/"):
+            mapped = Path(target_prefix + raw[len(source_prefix):])
+            if mapped.exists():
+                return mapped
+            return mapped
+    return candidate
 
 
-def _library_kind(file_path: Path) -> str:
-    name = file_path.name.lower()
-
-    # Le type est déterminé à partir du premier volume parent trouvé.
-    for volume in discover_scan_volumes():
-        try:
-            file_path.relative_to(volume)
-            volume_name = volume.name.lower()
-
-            if volume_name in ("films", "film", "movies", "movie"):
-                return "film"
-
-            if volume_name in ("series", "séries", "tv", "shows", "show"):
-                return "serie"
-
-            return volume.name
-        except ValueError:
+def _radarr_scan_items() -> list[dict[str, Any]]:
+    movies = _arr_request(RADARR_URL, RADARR_API_KEY, "movie")
+    items: list[dict[str, Any]] = []
+    for movie in movies if isinstance(movies, list) else []:
+        movie_file = movie.get("movieFile") or {}
+        raw_path = movie_file.get("path") or movie.get("path")
+        if not movie.get("hasFile") or not raw_path:
             continue
+        tmdb_id = movie.get("tmdbId")
+        items.append({
+            "type": "Film",
+            "title": movie.get("title") or Path(raw_path).stem,
+            "raw_path": raw_path,
+            "path": _resolve_arr_media_path(raw_path),
+            "arr_source": "Radarr",
+            "arr_url": f"{RADARR_URL}/movie/{tmdb_id}" if tmdb_id else RADARR_URL,
+            "arr_id": movie.get("id"),
+        })
+    return items
 
-    return "inconnu"
 
-
-def _relative_library_path(file_path: Path) -> str:
-    for root in discover_scan_volumes():
+def _sonarr_scan_items() -> list[dict[str, Any]]:
+    series_list = _arr_request(SONARR_URL, SONARR_API_KEY, "series")
+    items: list[dict[str, Any]] = []
+    for series in series_list if isinstance(series_list, list) else []:
+        series_id = series.get("id")
+        if series_id is None:
+            continue
+        tvdb_id = series.get("tvdbId")
+        series_url = f"{SONARR_URL}/series/{tvdb_id}" if tvdb_id and str(tvdb_id) != "0" else SONARR_URL
         try:
-            return f"{_volume_label(root)}/{file_path.relative_to(root)}"
-        except ValueError:
-            pass
+            episode_files = _arr_request(SONARR_URL, SONARR_API_KEY, "episodefile", {"seriesId": series_id})
+        except Exception as exc:
+            log.warning("[SCAN] Impossible de récupérer les fichiers de la série '%s' : %s", series.get("title"), exc)
+            continue
+        for episode_file in episode_files if isinstance(episode_files, list) else []:
+            raw_path = episode_file.get("path")
+            if not raw_path:
+                continue
+            season = episode_file.get("seasonNumber")
+            episodes = episode_file.get("episodes") or []
+            episode_labels = []
+            for ep in episodes:
+                n = ep.get("episodeNumber")
+                if n is not None:
+                    episode_labels.append(f"E{int(n):02d}")
+            suffix = "".join(episode_labels) if episode_labels else ""
+            episode_title = series.get("title") or Path(raw_path).stem
+            if season is not None:
+                episode_title += f" — S{int(season):02d}{suffix}"
+            items.append({
+                "type": "Série",
+                "title": episode_title,
+                "raw_path": raw_path,
+                "path": _resolve_arr_media_path(raw_path),
+                "arr_source": "Sonarr",
+                "arr_url": series_url,
+                "arr_id": series_id,
+            })
+    return items
 
-    return str(file_path)
 
+def _scan_items(scope: str) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    if scope in ("films", "all"):
+        items.extend(_radarr_scan_items())
+    if scope in ("series", "all"):
+        items.extend(_sonarr_scan_items())
+    return items
 
-def _media_signature(file_path: Path) -> tuple[str, int] | None:
-    """
-    Signature légère pour éviter d'analyser deux fois le même média présent
-    dans plusieurs volumes (ex. Téléchargements puis Films via Radarr).
-
-    On utilise nom de fichier + taille. Cela évite un hash complet très coûteux
-    sur de gros fichiers vidéo et limite fortement les doublons classiques.
-    """
-    try:
-        stat = file_path.stat()
-        return (file_path.name.casefold(), stat.st_size)
-    except OSError:
-        return None
-
-
-def _inode_signature(file_path: Path) -> tuple[int, int] | None:
-    """
-    Détection exacte des hardlinks / mêmes fichiers physiques.
-    """
-    try:
-        stat = file_path.stat()
-        return (stat.st_dev, stat.st_ino)
-    except OSError:
-        return None
 
 def run_library_scan(scope: str) -> None:
     if not scan_lock.acquire(blocking=False):
         log.warning("Un scan de bibliothèque est déjà en cours.")
         return
-
     try:
         _scan_reset(scope)
-        roots = _scan_roots(scope)
+        log.info("[SCAN] Récupération de la bibliothèque '%s' via Radarr/Sonarr...", scope)
+        items = _scan_items(scope)
+        scan_state["total_files"] = len(items)
+        log.info("[SCAN] %d média(s) référencé(s) par Radarr/Sonarr.", len(items))
 
-        files: list[Path] = []
-        seen_inodes: set[tuple[int, int]] = set()
-        seen_media: set[tuple[str, int]] = set()
-
-        for root in roots:
-            if not root.exists():
-                log.warning("Volume introuvable : %s", root)
-                continue
-
-            for path in sorted(root.rglob("*")):
-                if not path.is_file() or path.suffix.lower() != ".mkv":
-                    continue
-
-                inode_signature = _inode_signature(path)
-                media_signature = _media_signature(path)
-
-                # Même fichier physique (hardlink / bind visible plusieurs fois).
-                if inode_signature and inode_signature in seen_inodes:
-                    scan_state["duplicates_skipped"] += 1
-                    continue
-
-                # Même nom + même taille dans plusieurs volumes :
-                # cas classique Téléchargements -> Films/Séries.
-                if media_signature and media_signature in seen_media:
-                    scan_state["duplicates_skipped"] += 1
-                    continue
-
-                if inode_signature:
-                    seen_inodes.add(inode_signature)
-
-                if media_signature:
-                    seen_media.add(media_signature)
-
-                files.append(path)
-
-        scan_state["total_files"] = len(files)
-
-        log.info(
-            "[SCAN] Démarrage du scan '%s' : %d MKV unique(s), %d doublon(s) ignoré(s), %d volume(s).",
-            scope,
-            len(files),
-            scan_state["duplicates_skipped"],
-            len(roots),
-        )
-
-        for file_path in files:
-            scan_state["current_file"] = str(file_path)
-
+        for item in items:
+            raw_path = item.get("raw_path")
+            file_path = item.get("path")
+            scan_state["current_file"] = raw_path or item.get("title")
             result: dict[str, Any] = {
-                "path": str(file_path),
-                "relative_path": _relative_library_path(file_path),
-                "type": _library_kind(file_path),
+                "path": str(file_path) if file_path else raw_path,
+                "relative_path": raw_path or item.get("title"),
+                "type": item.get("type", "inconnu"),
+                "title": item.get("title"),
+                "arr_source": item.get("arr_source"),
+                "arr_url": item.get("arr_url"),
                 "forced_french": False,
                 "status": "ok",
                 "error": None,
                 "forced_tracks": [],
                 "subtitles": [],
             }
-
             try:
+                if not file_path or not file_path.exists():
+                    raise FileNotFoundError(
+                        f"Fichier référencé par {item.get('arr_source')} introuvable dans ForcedFR : {raw_path}"
+                    )
                 probe = run_ffprobe(file_path)
                 detection = detect_french_forced(probe)
-
-                result["forced_french"] = bool(
-                    detection.get("forced_french")
-                )
-                result["forced_tracks"] = detection.get(
-                    "forced_tracks", []
-                )
-                result["subtitles"] = detection.get(
-                    "subtitles", []
-                )
-
+                result["forced_french"] = bool(detection.get("forced_french"))
+                result["forced_tracks"] = detection.get("forced_tracks", [])
+                result["subtitles"] = detection.get("subtitles", [])
                 if result["forced_french"]:
                     scan_state["files_with_forced_fr"] += 1
                 else:
                     scan_state["files_without_forced_fr"] += 1
                     scan_state["results"].append(result)
-
             except Exception as exc:
                 result["status"] = "error"
                 result["error"] = str(exc)
                 scan_state["errors"] += 1
                 scan_state["results"].append(result)
-
-                log.warning(
-                    "[SCAN] Erreur sur %s : %s",
-                    file_path,
-                    exc,
-                )
-
+                log.warning("[SCAN] Erreur sur %s : %s", raw_path or item.get("title"), exc)
             finally:
                 scan_state["processed_files"] += 1
 
-        log.info(
-            "[SCAN] Terminé : %d analysé(s), %d sans FR Forced, %d doublon(s) ignoré(s), %d erreur(s).",
-            scan_state["processed_files"],
-            scan_state["files_without_forced_fr"],
-            scan_state.get("duplicates_skipped", 0),
-            scan_state["errors"],
-        )
-
+        log.info("[SCAN] Terminé : %d analysé(s), %d sans FR Forced, %d erreur(s).",
+                 scan_state["processed_files"], scan_state["files_without_forced_fr"], scan_state["errors"])
     except Exception as exc:
         scan_state["last_error"] = str(exc)
         log.exception("[SCAN] Erreur générale.")
-
     finally:
         scan_state["running"] = False
         scan_state["current_file"] = None
@@ -2455,25 +2373,10 @@ def run_library_scan(scope: str) -> None:
 
 def start_library_scan(scope: str) -> dict[str, Any]:
     if scan_state.get("running"):
-        raise HTTPException(
-            status_code=409,
-            detail="Un scan de bibliothèque est déjà en cours.",
-        )
-
-    thread = threading.Thread(
-        target=run_library_scan,
-        args=(scope,),
-        daemon=True,
-        name=f"forcedfr-scan-{scope}",
-    )
+        raise HTTPException(status_code=409, detail="Un scan de bibliothèque est déjà en cours.")
+    thread = threading.Thread(target=run_library_scan, args=(scope,), daemon=True, name=f"forcedfr-scan-{scope}")
     thread.start()
-
-    return {
-        "ok": True,
-        "message": f"Scan '{scope}' démarré.",
-        "scope": scope,
-    }
-
+    return {"ok": True, "message": f"Scan '{scope}' démarré.", "scope": scope}
 
 def _discord_status() -> str:
     if discord_bot is None:
@@ -2499,7 +2402,7 @@ def web_dashboard() -> str:
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ForcedFR v2.0</title>
+<title>ForcedFR v2.1</title>
 <style>
 :root{color-scheme:dark;font-family:Inter,system-ui,Arial,sans-serif}
 *{box-sizing:border-box} body{margin:0;background:#0d1117;color:#e6edf3}
@@ -2587,7 +2490,7 @@ async function refresh(){
   const pct=x.total_files?Math.round((x.processed_files/x.total_files)*100):0;
   document.getElementById('bar').style.width=pct+'%';
   document.getElementById('scanLabel').textContent=x.running?('Scan en cours : '+pct+'%'+(x.current_file?' — '+x.current_file:'' )):(x.finished_at?'Dernier scan terminé.':'Aucun scan en cours.');
-  document.getElementById('scanStats').textContent='Analysés : '+x.processed_files+'/'+x.total_files+' • Avec FR Forced : '+x.files_with_forced_fr+' • Sans FR Forced : '+x.files_without_forced_fr+' • Doublons ignorés : '+(x.duplicates_skipped||0)+' • Erreurs : '+x.errors;
+  document.getElementById('scanStats').textContent='Analysés : '+x.processed_files+'/'+x.total_files+' • Avec FR Forced : '+x.files_with_forced_fr+' • Sans FR Forced : '+x.files_without_forced_fr+' • Erreurs : '+x.errors;
 
   // Les résultats ne sont récupérés qu'au chargement initial et à la fin d'un scan.
   if(!resultsLoaded || (previousScanRunning===true && x.running===false)){
@@ -2613,7 +2516,7 @@ def status() -> dict[str, Any]:
 
     return {
         "status": "ok",
-        "version": "2.0.1",
+        "version": "2.1.0",
         "uptime_seconds": int(time.time() - SERVICE_STARTED_AT),
         "qbittorrent": {
             "status": qb_status,
@@ -2638,14 +2541,10 @@ def status() -> dict[str, Any]:
             "duplicates_skipped": scan_state.get("duplicates_skipped", 0),
         },
         "libraries": {
-            "scan_root": str(SCAN_ROOT),
-            "volumes": [
-                {
-                    "name": _volume_label(volume),
-                    "path": str(volume),
-                }
-                for volume in discover_scan_volumes()
-            ],
+            "source": "Radarr / Sonarr",
+            "radarr": {"configured": bool(RADARR_URL and RADARR_API_KEY), "url": RADARR_URL},
+            "sonarr": {"configured": bool(SONARR_URL and SONARR_API_KEY), "url": SONARR_URL},
+            "path_mappings_configured": len(ARR_PATH_MAPPINGS),
         },
     }
 
