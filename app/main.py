@@ -94,7 +94,7 @@ log = logging.getLogger("forcedfr")
 app = FastAPI(
     title="ForcedFR",
     description="Détection automatique des pistes françaises forcées.",
-    version="2.4.0",
+    version="2.4.1",
 )
 
 
@@ -2237,15 +2237,13 @@ def init_database() -> None:
             )
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_library_analysis_path ON library_analysis(path)")
-        # Migration automatique vers v2.4.0 : décisions de traitement manuel
-        # des médias sans piste FR Forced.
-        library_columns = {row["name"] for row in conn.execute("PRAGMA table_info(library_analysis)").fetchall()}
+        existing_library_columns = {row["name"] for row in conn.execute("PRAGMA table_info(library_analysis)").fetchall()}
         for column, definition in (
             ("review_status", "TEXT NOT NULL DEFAULT 'pending'"),
             ("reviewed_at", "REAL"),
             ("review_note", "TEXT"),
         ):
-            if column not in library_columns:
+            if column not in existing_library_columns:
                 conn.execute(f"ALTER TABLE library_analysis ADD COLUMN {column} {definition}")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_library_analysis_review_status ON library_analysis(review_status)")
 
@@ -2299,6 +2297,27 @@ def _media_cache_key(item: dict[str, Any], file_path: Path) -> str:
     return f"{item.get('type','')}|{str(file_path.resolve())}"
 
 
+def get_library_review_status(item: dict[str, Any], file_path: Path) -> dict[str, Any]:
+    key = _media_cache_key(item, file_path)
+    with _db_connect() as conn:
+        row = conn.execute("SELECT review_status, reviewed_at, review_note FROM library_analysis WHERE media_key = ?", (key,)).fetchone()
+    if not row:
+        return {"review_status": "pending", "reviewed_at": None, "review_note": None}
+    return {"review_status": row["review_status"] or "pending", "reviewed_at": row["reviewed_at"], "review_note": row["review_note"]}
+
+
+def set_library_review_status(media_key: str, review_status: str, review_note: str | None = None) -> bool:
+    allowed = {"pending", "validated", "waiting_replacement"}
+    if review_status not in allowed:
+        raise HTTPException(status_code=400, detail="Statut de traitement invalide.")
+    with _db_connect() as conn:
+        row = conn.execute("SELECT media_key FROM library_analysis WHERE media_key = ?", (media_key,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Analyse de bibliothèque introuvable.")
+        conn.execute("UPDATE library_analysis SET review_status=?, reviewed_at=?, review_note=? WHERE media_key=?", (review_status, None if review_status == "pending" else time.time(), review_note, media_key))
+    return True
+
+
 def _cached_analysis(item: dict[str, Any], file_path: Path) -> dict[str, Any] | None:
     stat = file_path.stat()
     key = _media_cache_key(item, file_path)
@@ -2313,9 +2332,9 @@ def _cached_analysis(item: dict[str, Any], file_path: Path) -> dict[str, Any] | 
         "forced_tracks": json.loads(row["forced_tracks"] or "[]"),
         "subtitles": json.loads(row["subtitles"] or "[]"),
         "analyzed_at": row["analyzed_at"],
-        "review_status": row["review_status"] or "pending",
-        "reviewed_at": row["reviewed_at"],
-        "review_note": row["review_note"],
+        "review_status": row["review_status"] if "review_status" in row.keys() else "pending",
+        "reviewed_at": row["reviewed_at"] if "reviewed_at" in row.keys() else None,
+        "review_note": row["review_note"] if "review_note" in row.keys() else None,
     }
 
 
@@ -2325,49 +2344,19 @@ def _save_cached_analysis(item: dict[str, Any], file_path: Path, detection: dict
     with _db_connect() as conn:
         conn.execute("""
             INSERT INTO library_analysis
-            (media_key, media_type, path, size, mtime_ns, forced_french, forced_tracks, subtitles, analyzed_at, review_status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+            (media_key, media_type, path, size, mtime_ns, forced_french, forced_tracks, subtitles, analyzed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(media_key) DO UPDATE SET
                 media_type=excluded.media_type, path=excluded.path, size=excluded.size,
                 mtime_ns=excluded.mtime_ns, forced_french=excluded.forced_french,
                 forced_tracks=excluded.forced_tracks, subtitles=excluded.subtitles,
-                analyzed_at=excluded.analyzed_at,
-                review_status=CASE WHEN excluded.forced_french=1 THEN 'pending' ELSE library_analysis.review_status END,
-                reviewed_at=CASE WHEN excluded.forced_french=1 THEN NULL ELSE library_analysis.reviewed_at END,
-                review_note=CASE WHEN excluded.forced_french=1 THEN NULL ELSE library_analysis.review_note END
+                analyzed_at=excluded.analyzed_at
         """, (
             key, item.get("type", "inconnu"), str(file_path.resolve()), int(stat.st_size),
             int(stat.st_mtime_ns), int(bool(detection.get("forced_french"))),
             json.dumps(detection.get("forced_tracks", []), ensure_ascii=False),
             json.dumps(detection.get("subtitles", []), ensure_ascii=False), time.time(),
         ))
-
-
-def _get_media_review(media_key: str) -> dict[str, Any]:
-    with _db_connect() as conn:
-        row = conn.execute("SELECT review_status, reviewed_at, review_note FROM library_analysis WHERE media_key=?", (media_key,)).fetchone()
-    if not row:
-        return {"review_status": "pending", "reviewed_at": None, "review_note": None}
-    return {"review_status": row["review_status"] or "pending", "reviewed_at": row["reviewed_at"], "review_note": row["review_note"]}
-
-def set_media_review(media_key: str, review_status: str, review_note: str | None = None) -> bool:
-    allowed = {"pending", "validated", "waiting_replacement"}
-    if review_status not in allowed:
-        raise ValueError("Statut de traitement invalide")
-    with _db_connect() as conn:
-        cur = conn.execute(
-            "UPDATE library_analysis SET review_status=?, reviewed_at=?, review_note=? WHERE media_key=?",
-            (review_status, None if review_status == "pending" else time.time(), review_note, media_key),
-        )
-        return cur.rowcount > 0
-
-
-def apply_media_review_to_result(result: dict[str, Any]) -> None:
-    key = result.get("media_key")
-    if not key:
-        result["review_status"] = "pending"
-        return
-    result.update(_get_media_review(str(key)))
 
 
 init_database()
@@ -2782,15 +2771,15 @@ def run_library_scan(scope: str, mode: str = "incremental") -> None:
                 "episode": item.get("episode"),
                 "season_number": item.get("season_number"),
                 "episode_number": item.get("episode_number"),
-                "media_key": _media_cache_key(item, file_path) if file_path else None,
-                "review_status": "pending",
-                "reviewed_at": None,
-                "review_note": None,
                 "forced_french": False,
                 "status": "ok",
                 "error": None,
                 "forced_tracks": [],
                 "subtitles": [],
+                "media_key": _media_cache_key(item, file_path) if file_path and file_path.exists() else None,
+                "review_status": "pending",
+                "reviewed_at": None,
+                "review_note": None,
             }
             try:
                 if not file_path or not file_path.exists():
@@ -2815,11 +2804,12 @@ def run_library_scan(scope: str, mode: str = "incremental") -> None:
                     result["subtitles"] = detection.get("subtitles", [])
                     result["from_cache"] = False
                     _save_cached_analysis(item, file_path, detection)
-                    apply_media_review_to_result(result)
+                    review = get_library_review_status(item, file_path)
+                    result["review_status"] = review["review_status"]
+                    result["reviewed_at"] = review["reviewed_at"]
+                    result["review_note"] = review["review_note"]
                     scan_state["reanalyzed"] += 1
                 if result["forced_french"]:
-                    # Un média avec Forced FR n'a plus besoin de traitement manuel.
-                    result["review_status"] = "pending"
                     scan_state["files_with_forced_fr"] += 1
                 else:
                     scan_state["files_without_forced_fr"] += 1
@@ -2876,7 +2866,7 @@ def _qbittorrent_status() -> tuple[str, int | None]:
 def web_dashboard() -> str:
     return """<!doctype html>
 <html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ForcedFR v2.4.0</title>
+<title>ForcedFR v2.4.1</title>
 <style>
 :root{color-scheme:dark;--bg:#0d1117;--p:#161b22;--b:#30363d;--m:#8b949e;--t:#e6edf3;--g:#3fb950;--y:#d29922;--r:#f85149;font-family:Inter,system-ui,sans-serif}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--t)}main{max-width:1320px;margin:auto;padding:28px}h1{margin:0}.sub,.small{color:var(--m)}
@@ -2890,7 +2880,7 @@ select,input{background:#0f141b;color:white;border:1px solid var(--b);border-rad
 .badge{font-weight:700}.yes{color:var(--g)}.no{color:var(--r)}.err{color:var(--y)}a.btn{display:inline-block;background:#1f6feb;color:white;text-decoration:none;padding:7px 10px;border-radius:7px;font-size:.82rem;margin:2px 4px 2px 0;white-space:nowrap}
 .empty{color:var(--m);text-align:center;padding:22px}@media(max-width:700px){main{padding:16px}}
 </style></head><body><main>
-<h1>ForcedFR <span class="small">v2.4.0</span></h1><p class="sub">Surveillance qBittorrent et contrôle des bibliothèques Radarr / Sonarr.</p>
+<h1>ForcedFR <span class="small">v2.4.1</span></h1><p class="sub">Surveillance qBittorrent et contrôle des bibliothèques Radarr / Sonarr.</p>
 <div class="grid">
 <div class="card"><div class="label">ForcedFR</div><div class="value ok">● En ligne</div></div>
 <div class="card"><div class="label">qBittorrent</div><div class="value" id="qb">…</div></div>
@@ -2905,11 +2895,11 @@ select,input{background:#0f141b;color:white;border:1px solid var(--b);border-rad
 <div class="small" id="scanLabel">Aucun scan en cours.</div><div class="progress"><div id="bar"></div></div><div class="small" id="stats"></div></div>
 <div class="subtabs" style="margin:20px 0"><button class="subtab active" data-kind="films">🎬 Films</button><button class="subtab" data-kind="series">📺 Séries</button></div>
 
-<div id="k-films"><h2>Films</h2><div class="filters"><select id="ff"><option value="all">Tous</option><option value="yes">Avec Forced FR</option><option value="no">Sans Forced FR</option><option value="error">Erreurs</option><option value="pending">À traiter</option><option value="validated">Absence normale</option><option value="waiting">En attente</option></select><input id="fs" placeholder="Rechercher un film…"></div>
-<div class="tablewrap"><table><thead><tr><th>Film</th><th>Forced FR</th><th>Action</th></tr></thead><tbody id="films"></tbody></table></div></div>
+<div id="k-films"><h2>Films</h2><div class="filters"><select id="ff"><option value="all">Tous</option><option value="yes">Avec Forced FR</option><option value="no">Sans Forced FR</option><option value="error">Erreurs</option><option value="pending">🔴 À traiter</option><option value="validated">🟢 Absence normale</option><option value="waiting_replacement">🟠 En attente</option></select><input id="fs" placeholder="Rechercher un film…"></div>
+<div class="tablewrap"><table><thead><tr><th>Film</th><th>Forced FR</th><th>Statut</th><th>Action</th></tr></thead><tbody id="films"></tbody></table></div></div>
 
-<div id="k-series" style="display:none"><h2>Séries</h2><div class="filters"><select id="sf"><option value="all">Tous</option><option value="yes">Avec Forced FR</option><option value="no">Sans Forced FR</option><option value="error">Erreurs</option><option value="pending">À traiter</option><option value="validated">Absence normale</option><option value="waiting">En attente</option></select><input id="ss" placeholder="Rechercher une série ou un épisode…"></div>
-<div class="tablewrap"><table><thead><tr><th>Série</th><th>Saison</th><th>Épisode</th><th>Forced FR</th><th>Action</th></tr></thead><tbody id="series"></tbody></table></div></div>
+<div id="k-series" style="display:none"><h2>Séries</h2><div class="filters"><select id="sf"><option value="all">Tous</option><option value="yes">Avec Forced FR</option><option value="no">Sans Forced FR</option><option value="error">Erreurs</option><option value="pending">🔴 À traiter</option><option value="validated">🟢 Absence normale</option><option value="waiting_replacement">🟠 En attente</option></select><input id="ss" placeholder="Rechercher une série ou un épisode…"></div>
+<div class="tablewrap"><table><thead><tr><th>Série</th><th>Saison</th><th>Épisode</th><th>Forced FR</th><th>Statut</th><th>Action</th></tr></thead><tbody id="series"></tbody></table></div></div>
 </section>
 
 <section id="p-history" class="panel"><h2>Historique des analyses</h2><p class="sub">Historique persistant des analyses et décisions prises sur les téléchargements.</p>
@@ -2923,13 +2913,12 @@ function st(id,s,e=''){const m={connected:['● Connecté','ok'],connecting:['�
 document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>{document.querySelectorAll('.tab').forEach(x=>x.classList.toggle('active',x===b));document.querySelectorAll('.panel').forEach(x=>x.classList.remove('active'));$('p-'+b.dataset.tab).classList.add('active');if(b.dataset.tab==='history')loadHistory()});
 document.querySelectorAll('.subtab').forEach(b=>b.onclick=()=>{document.querySelectorAll('.subtab').forEach(x=>x.classList.toggle('active',x===b));['films','series'].forEach(k=>$('k-'+k).style.display=k===b.dataset.kind?'block':'none')});
 async function startScan(s,m='incremental'){try{await api('/scan/'+s+'?mode='+encodeURIComponent(m),{method:'POST'});loaded=false;refresh()}catch(e){alert(e.message)}}
-function rows(kind){const f=$(kind==='films'?'ff':'sf').value,q=$(kind==='films'?'fs':'ss').value.toLowerCase();return data.filter(i=>(kind==='films'?i.type==='Film':i.type==='Série')).filter(i=>{const rs=i.review_status||'pending';if(f==='all')return true;if(f==='error')return i.status==='error';if(f==='yes')return i.status!=='error'&&i.forced_french;if(f==='no')return i.status!=='error'&&!i.forced_french;if(f==='pending')return i.status!=='error'&&!i.forced_french&&rs==='pending';if(f==='validated')return i.status!=='error'&&!i.forced_french&&rs==='validated';if(f==='waiting')return i.status!=='error'&&!i.forced_french&&rs==='waiting_replacement';return true}).filter(i=>!q||(i.title+' '+(i.season||'')+' '+(i.episode||'')).toLowerCase().includes(q))}
+function rows(kind){const f=$(kind==='films'?'ff':'sf').value,q=$(kind==='films'?'fs':'ss').value.toLowerCase();return data.filter(i=>(kind==='films'?i.type==='Film':i.type==='Série')).filter(i=>{if(f==='all')return true;if(f==='error')return i.status==='error';if(f==='yes')return i.status!=='error'&&!!i.forced_french;if(f==='no')return i.status!=='error'&&!i.forced_french;if(['pending','validated','waiting_replacement'].includes(f))return i.status!=='error'&&!i.forced_french&&(i.review_status||'pending')===f;return true}).filter(i=>!q||(i.title+' '+(i.season||'')+' '+(i.episode||'')).toLowerCase().includes(q))}
 function badge(i){return i.status==='error'?'<span class="badge err">⚠ Erreur</span>':i.forced_french?'<span class="badge yes">✅ Oui</span>':'<span class="badge no">❌ Non</span>'}
-function reviewBadge(i){if(i.forced_french||i.status==='error')return '';const m={pending:'<span class="badge no">🔴 À traiter</span>',validated:'<span class="badge yes">🟢 Absence normale</span>',waiting_replacement:'<span class="badge err">🟠 En attente</span>'};return '<div class="small" style="margin-top:6px">'+(m[i.review_status||'pending']||m.pending)+'</div>'}
-async function setReview(i,status){if(!i||!i.media_key)return alert('Identifiant du média indisponible. Relance un scan pour mettre à jour cette entrée.');try{await api('/library/review',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({media_key:i.media_key,review_status:status})});i.review_status=status;i.reviewed_at=status==='pending'?null:Date.now()/1000;render('films');render('series')}catch(e){alert(e.message)}}
-async function setReviewByKey(encoded,status){const key=decodeURIComponent(encoded);const item=data.find(x=>x.media_key===key);await setReview(item,status)}
-function mediaActions(i){let a=[];if(i.arr_url)a.push('<a class="btn" target="_blank" href="'+esc(i.arr_url)+'">Ouvrir '+esc(i.arr_source)+'</a>');if(i.status!=='error'&&!i.forced_french){const key=encodeURIComponent(i.media_key||'');if((i.review_status||'pending')==='pending'){a.push('<button onclick="setReviewByKey(\''+key+'\',\'validated\')">✓ C’est normal</button>');a.push('<button onclick="setReviewByKey(\''+key+'\',\'waiting_replacement\')">⏳ Attendre</button>')}else{a.push('<button onclick="setReviewByKey(\''+key+'\',\'pending\')">↩ À traiter</button>')}}return a.join(' ')}
-function render(kind){const r=rows(kind),t=$(kind);const cols=kind==='series'?5:3;t.innerHTML=r.length?r.map(i=>'<tr><td>'+esc(i.title)+'</td>'+(kind==='series'?'<td>'+esc(i.season||'—')+'</td><td>'+esc(i.episode||'—')+'</td>':'')+'<td>'+badge(i)+reviewBadge(i)+(i.error?'<div class="small">'+esc(i.error)+'</div>':'')+'</td><td>'+mediaActions(i)+'</td></tr>').join(''):'<tr><td colspan="'+cols+'" class="empty">Aucun résultat correspondant.</td></tr>'}
+function reviewBadge(i){if(i.status==='error'||i.forced_french)return '—';const s=i.review_status||'pending';const m={pending:'<span class="badge no">🔴 À traiter</span>',validated:'<span class="badge yes">🟢 Absence normale</span>',waiting_replacement:'<span class="badge err">🟠 En attente</span>'};return m[s]||m.pending}
+function reviewActions(i){if(i.status==='error'||i.forced_french||!i.media_key)return '';const key=encodeURIComponent(i.media_key),s=i.review_status||'pending';if(s==='pending')return '<button onclick="setReview(\''+key+'\',\'validated\')">✓ C\'est normal</button><button onclick="setReview(\''+key+'\',\'waiting_replacement\')">⏳ Attendre</button>';return '<button onclick="setReview(\''+key+'\',\'pending\')">↩ À traiter</button>'}
+async function setReview(encodedKey,status){try{const key=decodeURIComponent(encodedKey);await api('/library/review?media_key='+encodeURIComponent(key)+'&status='+encodeURIComponent(status),{method:'POST'});data.forEach(i=>{if(i.media_key===key)i.review_status=status});render('films');render('series')}catch(e){alert(e.message)}}
+function render(kind){const r=rows(kind),t=$(kind);const cols=kind==='series'?6:4;t.innerHTML=r.length?r.map(i=>'<tr><td>'+esc(i.title)+'</td>'+(kind==='series'?'<td>'+esc(i.season||'—')+'</td><td>'+esc(i.episode||'—')+'</td>':'')+'<td>'+badge(i)+(i.error?'<div class="small">'+esc(i.error)+'</div>':'')+'</td><td>'+reviewBadge(i)+'</td><td>'+(i.arr_url?'<a class="btn" target="_blank" href="'+esc(i.arr_url)+'">Ouvrir '+esc(i.arr_source)+'</a>':'')+reviewActions(i)+'</td></tr>').join(''):'<tr><td colspan="'+cols+'" class="empty">Aucun résultat correspondant.</td></tr>'}
 async function loadResults(){data=(await api('/scan/results')).results||[];render('films');render('series');loaded=true}
 ['ff','fs'].forEach(id=>$(id).oninput=()=>render('films'));['sf','ss'].forEach(id=>$(id).oninput=()=>render('series'));
 function historyResult(i){const m={forced_found:'<span class="badge yes">✅ Forced FR détecté</span>',no_forced:'<span class="badge no">❌ Pas de Forced FR</span>',error:'<span class="badge err">⚠ Erreur d’analyse</span>'};return m[i.result]||'<span class="badge">'+esc(i.result||'—')+'</span>'}
@@ -2947,7 +2936,7 @@ def status() -> dict[str, Any]:
 
     return {
         "status": "ok",
-        "version": "2.4.0",
+        "version": "2.4.1",
         "uptime_seconds": int(time.time() - SERVICE_STARTED_AT),
         "qbittorrent": {
             "status": qb_status,
@@ -2994,6 +2983,12 @@ def history() -> dict[str, Any]:
     }
 
 
+@app.post("/library/review")
+def library_review(media_key: str, status: str, note: str | None = None) -> dict[str, Any]:
+    set_library_review_status(media_key, status, note)
+    return {"ok": True, "media_key": media_key, "review_status": status}
+
+
 @app.get("/scan/status")
 def scan_status() -> dict[str, Any]:
     return dict(scan_state)
@@ -3005,24 +3000,6 @@ def scan_results() -> dict[str, Any]:
         "running": scan_state.get("running", False),
         "results": list(scan_state.get("results", [])),
     }
-
-@app.post("/library/review")
-def update_library_review(payload: dict[str, Any]) -> dict[str, Any]:
-    media_key = str(payload.get("media_key") or "").strip()
-    review_status = str(payload.get("review_status") or "").strip()
-    review_note = payload.get("review_note")
-    if not media_key:
-        raise HTTPException(status_code=400, detail="media_key manquant")
-    if review_status not in {"pending", "validated", "waiting_replacement"}:
-        raise HTTPException(status_code=400, detail="Statut de traitement invalide")
-    if not set_media_review(media_key, review_status, review_note if isinstance(review_note, str) else None):
-        raise HTTPException(status_code=404, detail="Média introuvable dans la base d'analyse. Relancez un scan.")
-    for item in scan_state.get("results", []):
-        if item.get("media_key") == media_key:
-            item["review_status"] = review_status
-            item["reviewed_at"] = None if review_status == "pending" else time.time()
-            item["review_note"] = review_note if isinstance(review_note, str) else None
-    return {"ok": True, "media_key": media_key, "review_status": review_status}
 
 
 @app.post("/scan/films")
