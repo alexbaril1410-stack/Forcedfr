@@ -1,1 +1,452 @@
+* {
+    box-sizing: border-box;
+}
 
+body {
+    margin: 0;
+    font-family: Arial, Helvetica, sans-serif;
+    background: #f4f6f8;
+    color: #1f2933;
+}
+
+.app {
+    min-height: 100vh;
+}
+
+
+/* =========================================================
+   HEADER
+========================================================= */
+
+.header {
+    height: 82px;
+    background: #111827;
+    color: white;
+
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+
+    padding: 0 40px;
+}
+
+.brand {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+}
+
+.logo {
+    width: 46px;
+    height: 46px;
+
+    border-radius: 12px;
+
+    background: #2563eb;
+
+    display: flex;
+    align-items: center;
+    justify-content: center;
+
+    font-weight: bold;
+    font-size: 18px;
+}
+
+.brand h1 {
+    margin: 0;
+    font-size: 22px;
+}
+
+.brand span {
+    font-size: 13px;
+    color: #9ca3af;
+}
+
+.version {
+    background: #1f2937;
+
+    padding: 7px 12px;
+
+    border-radius: 8px;
+
+    font-size: 13px;
+    color: #d1d5db;
+}
+
+
+/* =========================================================
+   NAVIGATION
+========================================================= */
+
+.navigation {
+    background: white;
+
+    border-bottom: 1px solid #e5e7eb;
+
+    padding: 0 40px;
+
+    display: flex;
+    gap: 28px;
+}
+
+.nav-item {
+    padding: 18px 0;
+
+    text-decoration: none;
+
+    color: #6b7280;
+
+    font-size: 14px;
+
+    border-bottom: 3px solid transparent;
+}
+
+.nav-item:hover {
+    color: #2563eb;
+}
+
+.nav-item.active {
+    color: #2563eb;
+
+    border-bottom-color: #2563eb;
+
+    font-weight: 600;
+}
+
+
+/* =========================================================
+   CONTENT
+========================================================= */
+
+.content {
+    max-width: 1200px;
+
+    margin: auto;
+
+    padding: 40px;
+}
+
+.page-title {
+    display: flex;
+
+    justify-content: space-between;
+
+    align-items: center;
+
+    margin-bottom: 38px;
+}
+
+.page-title h2 {
+    margin: 0 0 8px;
+
+    font-size: 30px;
+}
+
+.page-title p {
+    margin: 0;
+
+    color: #6b7280;
+}
+
+.status-online {
+    background: #ecfdf5;
+
+    color: #047857;
+
+    padding: 9px 14px;
+
+    border-radius: 20px;
+
+    font-size: 13px;
+
+    display: flex;
+
+    align-items: center;
+
+    gap: 8px;
+}
+
+.status-dot {
+    width: 8px;
+    height: 8px;
+
+    background: #10b981;
+
+    border-radius: 50%;
+}
+
+
+/* =========================================================
+   SYSTEM STATUS
+========================================================= */
+
+section {
+    margin-bottom: 42px;
+}
+
+section h3 {
+    margin-bottom: 18px;
+
+    font-size: 18px;
+}
+
+.status-grid {
+    display: grid;
+
+    grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+
+    gap: 20px;
+}
+
+.status-card {
+    background: white;
+
+    border-radius: 12px;
+
+    padding: 22px;
+
+    display: flex;
+
+    align-items: center;
+
+    gap: 16px;
+
+    box-shadow:
+        0 2px 8px rgba(0,0,0,0.04);
+}
+
+.status-icon {
+    font-size: 28px;
+}
+
+.status-info {
+    display: flex;
+
+    flex-direction: column;
+
+    gap: 5px;
+}
+
+.status-info span {
+    font-size: 13px;
+
+    color: #6b7280;
+}
+
+.status-info strong {
+    font-size: 15px;
+
+    color: #059669;
+}
+
+
+/* =========================================================
+   STATISTICS
+========================================================= */
+
+.stats-grid {
+    display: grid;
+
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+
+    gap: 20px;
+}
+
+.stat-card {
+    background: white;
+
+    border-radius: 12px;
+
+    padding: 24px;
+
+    display: flex;
+
+    flex-direction: column;
+
+    gap: 8px;
+
+    box-shadow:
+        0 2px 8px rgba(0,0,0,0.04);
+}
+
+.stat-value {
+    font-size: 30px;
+
+    font-weight: bold;
+}
+
+.stat-label {
+    font-size: 13px;
+
+    color: #6b7280;
+}
+
+.stat-card.warning .stat-value {
+    color: #d97706;
+}
+
+
+/* =========================================================
+   SCANNER
+========================================================= */
+
+.scanner-section {
+    background: white;
+
+    border-radius: 16px;
+
+    padding: 30px;
+
+    box-shadow:
+        0 2px 10px rgba(0,0,0,0.04);
+}
+
+.section-header p {
+    color: #6b7280;
+
+    max-width: 650px;
+
+    line-height: 1.6;
+}
+
+.scanner-grid {
+    display: grid;
+
+    grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+
+    gap: 25px;
+
+    margin-top: 28px;
+}
+
+.scanner-card {
+    border: 1px solid #e5e7eb;
+
+    border-radius: 12px;
+
+    padding: 28px;
+
+    text-align: center;
+}
+
+.scanner-icon {
+    font-size: 42px;
+
+    margin-bottom: 10px;
+}
+
+.scanner-card h3 {
+    margin-bottom: 8px;
+}
+
+.scanner-card p {
+    color: #6b7280;
+
+    font-size: 14px;
+
+    min-height: 42px;
+}
+
+.scan-button {
+    border: none;
+
+    padding: 11px 18px;
+
+    border-radius: 8px;
+
+    font-size: 14px;
+
+    font-weight: 600;
+
+    margin-top: 15px;
+}
+
+.scan-button.disabled {
+    background: #e5e7eb;
+
+    color: #9ca3af;
+
+    cursor: not-allowed;
+}
+
+.scanner-card small {
+    display: block;
+
+    margin-top: 14px;
+
+    color: #9ca3af;
+}
+
+
+/* =========================================================
+   INFO BOX
+========================================================= */
+
+.info-box {
+    background: #eff6ff;
+
+    border: 1px solid #bfdbfe;
+
+    border-radius: 12px;
+
+    padding: 20px;
+
+    display: flex;
+
+    gap: 15px;
+
+    color: #1e3a8a;
+}
+
+.info-icon {
+    font-size: 24px;
+}
+
+.info-box strong {
+    display: block;
+
+    margin-bottom: 6px;
+}
+
+.info-box p {
+    margin: 0;
+
+    font-size: 14px;
+
+    line-height: 1.5;
+}
+
+
+/* =========================================================
+   RESPONSIVE
+========================================================= */
+
+@media (max-width: 700px) {
+
+    .header {
+        padding: 0 20px;
+    }
+
+    .navigation {
+        padding: 0 20px;
+
+        overflow-x: auto;
+    }
+
+    .content {
+        padding: 25px 20px;
+    }
+
+    .page-title {
+        flex-direction: column;
+
+        align-items: flex-start;
+
+        gap: 15px;
+    }
+
+    .brand span {
+        display: none;
+    }
+
+}
