@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import sqlite3
 import subprocess
 import threading
 import time
@@ -70,6 +71,9 @@ RELEASE_CONTEXT_TIMEOUT = 60
 STARTUP_STABILITY_CHECK_SECONDS = 5
 STARTUP_STABLE_CHECKS_REQUIRED = 3
 
+# Base SQLite persistante pour les analyses de bibliothèque.
+SQLITE_PATH = os.getenv("SQLITE_PATH", "/app/data/forcedfr.db")
+
 
 # ============================================================
 # LOGGING
@@ -90,7 +94,7 @@ log = logging.getLogger("forcedfr")
 app = FastAPI(
     title="ForcedFR",
     description="Détection automatique des pistes françaises forcées.",
-    version="2.1.3",
+    version="2.2.0",
 )
 
 
@@ -2184,7 +2188,83 @@ def _load_arr_path_mappings() -> list[tuple[str, str]]:
 ARR_PATH_MAPPINGS = _load_arr_path_mappings()
 SERVICE_STARTED_AT = time.time()
 
-# Préparation SQLite : historique isolé derrière cette structure mémoire.
+# ============================================================
+# SQLITE - CACHE DES ANALYSES DE BIBLIOTHÈQUE
+# ============================================================
+
+def _db_connect() -> sqlite3.Connection:
+    db_path = Path(SQLITE_PATH)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path), timeout=30)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_database() -> None:
+    with _db_connect() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS library_analysis (
+                media_key TEXT PRIMARY KEY,
+                media_type TEXT NOT NULL,
+                path TEXT NOT NULL,
+                size INTEGER NOT NULL,
+                mtime_ns INTEGER NOT NULL,
+                forced_french INTEGER NOT NULL,
+                forced_tracks TEXT NOT NULL DEFAULT '[]',
+                subtitles TEXT NOT NULL DEFAULT '[]',
+                analyzed_at REAL NOT NULL
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_library_analysis_path ON library_analysis(path)")
+    log.info("SQLite initialisée : %s", SQLITE_PATH)
+
+
+def _media_cache_key(item: dict[str, Any], file_path: Path) -> str:
+    # Le chemin résolu identifie physiquement le média. Le type évite tout conflit.
+    return f"{item.get('type','')}|{str(file_path.resolve())}"
+
+
+def _cached_analysis(item: dict[str, Any], file_path: Path) -> dict[str, Any] | None:
+    stat = file_path.stat()
+    key = _media_cache_key(item, file_path)
+    with _db_connect() as conn:
+        row = conn.execute("SELECT * FROM library_analysis WHERE media_key = ?", (key,)).fetchone()
+    if not row:
+        return None
+    if int(row["size"]) != int(stat.st_size) or int(row["mtime_ns"]) != int(stat.st_mtime_ns):
+        return None
+    return {
+        "forced_french": bool(row["forced_french"]),
+        "forced_tracks": json.loads(row["forced_tracks"] or "[]"),
+        "subtitles": json.loads(row["subtitles"] or "[]"),
+        "analyzed_at": row["analyzed_at"],
+    }
+
+
+def _save_cached_analysis(item: dict[str, Any], file_path: Path, detection: dict[str, Any]) -> None:
+    stat = file_path.stat()
+    key = _media_cache_key(item, file_path)
+    with _db_connect() as conn:
+        conn.execute("""
+            INSERT INTO library_analysis
+            (media_key, media_type, path, size, mtime_ns, forced_french, forced_tracks, subtitles, analyzed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(media_key) DO UPDATE SET
+                media_type=excluded.media_type, path=excluded.path, size=excluded.size,
+                mtime_ns=excluded.mtime_ns, forced_french=excluded.forced_french,
+                forced_tracks=excluded.forced_tracks, subtitles=excluded.subtitles,
+                analyzed_at=excluded.analyzed_at
+        """, (
+            key, item.get("type", "inconnu"), str(file_path.resolve()), int(stat.st_size),
+            int(stat.st_mtime_ns), int(bool(detection.get("forced_french"))),
+            json.dumps(detection.get("forced_tracks", []), ensure_ascii=False),
+            json.dumps(detection.get("subtitles", []), ensure_ascii=False), time.time(),
+        ))
+
+
+init_database()
+
+# Historique qBittorrent : conservé en mémoire, indépendant du cache SQLite bibliothèque.
 analysis_history: list[dict[str, Any]] = []
 ANALYSIS_HISTORY_LIMIT = int(os.getenv("ANALYSIS_HISTORY_LIMIT", "500"))
 
@@ -2209,6 +2289,7 @@ scan_lock = threading.Lock()
 scan_state: dict[str, Any] = {
     "running": False,
     "requested_scope": None,
+    "mode": "incremental",
     "started_at": None,
     "finished_at": None,
     "current_file": None,
@@ -2217,12 +2298,14 @@ scan_state: dict[str, Any] = {
     "files_with_forced_fr": 0,
     "files_without_forced_fr": 0,
     "errors": 0,
+    "cache_hits": 0,
+    "reanalyzed": 0,
     "results": [],
     "last_error": None,
 }
 
 
-def _scan_reset(scope: str) -> None:
+def _scan_reset(scope: str, mode: str = "incremental") -> None:
     existing_results = list(scan_state.get("results", []))
     if scope == "films":
         existing_results = [r for r in existing_results if r.get("type") != "Film"]
@@ -2234,6 +2317,7 @@ def _scan_reset(scope: str) -> None:
     scan_state.update({
         "running": True,
         "requested_scope": scope,
+        "mode": mode,
         "started_at": time.time(),
         "finished_at": None,
         "current_file": None,
@@ -2242,6 +2326,8 @@ def _scan_reset(scope: str) -> None:
         "files_with_forced_fr": 0,
         "files_without_forced_fr": 0,
         "errors": 0,
+        "cache_hits": 0,
+        "reanalyzed": 0,
         "results": existing_results,
         "last_error": None,
     })
@@ -2453,13 +2539,13 @@ def _scan_items(scope: str) -> list[dict[str, Any]]:
     return items
 
 
-def run_library_scan(scope: str) -> None:
+def run_library_scan(scope: str, mode: str = "incremental") -> None:
     if not scan_lock.acquire(blocking=False):
         log.warning("Un scan de bibliothèque est déjà en cours.")
         return
     try:
-        _scan_reset(scope)
-        log.info("[SCAN] Récupération de la bibliothèque '%s' via Radarr/Sonarr...", scope)
+        _scan_reset(scope, mode)
+        log.info("[SCAN] Récupération de la bibliothèque '%s' via Radarr/Sonarr (mode=%s)...", scope, mode)
         items = _scan_items(scope)
         scan_state["total_files"] = len(items)
         log.info("[SCAN] %d média(s) référencé(s) par Radarr/Sonarr.", len(items))
@@ -2490,11 +2576,22 @@ def run_library_scan(scope: str) -> None:
                     raise FileNotFoundError(
                         f"Fichier référencé par {item.get('arr_source')} introuvable dans ForcedFR : {raw_path}"
                     )
-                probe = run_ffprobe(file_path)
-                detection = detect_french_forced(probe)
-                result["forced_french"] = bool(detection.get("forced_french"))
-                result["forced_tracks"] = detection.get("forced_tracks", [])
-                result["subtitles"] = detection.get("subtitles", [])
+                cached = _cached_analysis(item, file_path) if mode == "incremental" else None
+                if cached is not None:
+                    result["forced_french"] = cached["forced_french"]
+                    result["forced_tracks"] = cached["forced_tracks"]
+                    result["subtitles"] = cached["subtitles"]
+                    result["from_cache"] = True
+                    scan_state["cache_hits"] += 1
+                else:
+                    probe = run_ffprobe(file_path)
+                    detection = detect_french_forced(probe)
+                    result["forced_french"] = bool(detection.get("forced_french"))
+                    result["forced_tracks"] = detection.get("forced_tracks", [])
+                    result["subtitles"] = detection.get("subtitles", [])
+                    result["from_cache"] = False
+                    _save_cached_analysis(item, file_path, detection)
+                    scan_state["reanalyzed"] += 1
                 if result["forced_french"]:
                     scan_state["files_with_forced_fr"] += 1
                 else:
@@ -2522,12 +2619,14 @@ def run_library_scan(scope: str) -> None:
         scan_lock.release()
 
 
-def start_library_scan(scope: str) -> dict[str, Any]:
+def start_library_scan(scope: str, mode: str = "incremental") -> dict[str, Any]:
     if scan_state.get("running"):
         raise HTTPException(status_code=409, detail="Un scan de bibliothèque est déjà en cours.")
-    thread = threading.Thread(target=run_library_scan, args=(scope,), daemon=True, name=f"forcedfr-scan-{scope}")
+    if mode not in ("incremental", "full"):
+        raise HTTPException(status_code=400, detail="Mode de scan invalide.")
+    thread = threading.Thread(target=run_library_scan, args=(scope, mode), daemon=True, name=f"forcedfr-scan-{scope}-{mode}")
     thread.start()
-    return {"ok": True, "message": f"Scan '{scope}' démarré.", "scope": scope}
+    return {"ok": True, "message": f"Scan '{scope}' ({mode}) démarré.", "scope": scope, "mode": mode}
 
 def _discord_status() -> str:
     if discord_bot is None:
@@ -2550,7 +2649,7 @@ def _qbittorrent_status() -> tuple[str, int | None]:
 def web_dashboard() -> str:
     return """<!doctype html>
 <html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ForcedFR v2.1.1</title>
+<title>ForcedFR v2.2.0</title>
 <style>
 :root{color-scheme:dark;--bg:#0d1117;--p:#161b22;--b:#30363d;--m:#8b949e;--t:#e6edf3;--g:#3fb950;--y:#d29922;--r:#f85149;font-family:Inter,system-ui,sans-serif}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--t)}main{max-width:1320px;margin:auto;padding:28px}h1{margin:0}.sub,.small{color:var(--m)}
@@ -2564,7 +2663,7 @@ select,input{background:#0f141b;color:white;border:1px solid var(--b);border-rad
 .badge{font-weight:700}.yes{color:var(--g)}.no{color:var(--r)}.err{color:var(--y)}a.btn{background:#1f6feb;color:white;text-decoration:none;padding:7px 10px;border-radius:7px;font-size:.82rem}
 .empty{color:var(--m);text-align:center;padding:22px}@media(max-width:700px){main{padding:16px}}
 </style></head><body><main>
-<h1>ForcedFR <span class="small">v2.1.3</span></h1><p class="sub">Surveillance qBittorrent et contrôle des bibliothèques Radarr / Sonarr.</p>
+<h1>ForcedFR <span class="small">v2.2.0</span></h1><p class="sub">Surveillance qBittorrent et contrôle des bibliothèques Radarr / Sonarr.</p>
 <div class="grid">
 <div class="card"><div class="label">ForcedFR</div><div class="value ok">● En ligne</div></div>
 <div class="card"><div class="label">qBittorrent</div><div class="value" id="qb">…</div></div>
@@ -2575,7 +2674,7 @@ select,input{background:#0f141b;color:white;border:1px solid var(--b);border-rad
 <div class="tabs"><button class="tab active" data-tab="scan">🔍 Scan de bibliothèque</button><button class="tab" data-tab="history">📜 Historique qBittorrent</button></div>
 
 <section id="p-scan" class="panel active">
-<div class="card"><div class="toolbar"><button onclick="startScan('films')">🎬 Scanner les films</button><button onclick="startScan('series')">📺 Scanner les séries</button><button onclick="startScan('all')">🔍 Scanner toute la bibliothèque</button></div>
+<div class="card"><div class="toolbar"><button onclick="startScan('films','incremental')">⚡ Films incrémental</button><button onclick="startScan('films','full')">🎬 Films complet</button><button onclick="startScan('series','incremental')">⚡ Séries incrémental</button><button onclick="startScan('series','full')">📺 Séries complet</button><button onclick="startScan('all','incremental')">⚡ Toute la bibliothèque</button></div>
 <div class="small" id="scanLabel">Aucun scan en cours.</div><div class="progress"><div id="bar"></div></div><div class="small" id="stats"></div></div>
 <div class="subtabs" style="margin:20px 0"><button class="subtab active" data-kind="films">🎬 Films</button><button class="subtab" data-kind="series">📺 Séries</button></div>
 
@@ -2596,14 +2695,14 @@ function esc(v){return String(v??'').replace(/[&<>\"']/g,c=>({'&':'&amp;','<':'&
 function st(id,s,e=''){const m={connected:['● Connecté','ok'],connecting:['● Connexion…','warn'],disabled:['● Désactivé','warn'],error:['● Indisponible','bad'],not_configured:['● Non configuré','warn'],unknown:['● Inconnu','warn']}[s]||['● '+s,'warn'];$(id).textContent=m[0]+(e?' '+e:'');$(id).className='value '+m[1]}
 document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>{document.querySelectorAll('.tab').forEach(x=>x.classList.toggle('active',x===b));document.querySelectorAll('.panel').forEach(x=>x.classList.remove('active'));$('p-'+b.dataset.tab).classList.add('active');if(b.dataset.tab==='history')loadHistory()});
 document.querySelectorAll('.subtab').forEach(b=>b.onclick=()=>{document.querySelectorAll('.subtab').forEach(x=>x.classList.toggle('active',x===b));['films','series'].forEach(k=>$('k-'+k).style.display=k===b.dataset.kind?'block':'none')});
-async function startScan(s){try{await api('/scan/'+s,{method:'POST'});loaded=false;refresh()}catch(e){alert(e.message)}}
+async function startScan(s,m='incremental'){try{await api('/scan/'+s+'?mode='+encodeURIComponent(m),{method:'POST'});loaded=false;refresh()}catch(e){alert(e.message)}}
 function rows(kind){const f=$(kind==='films'?'ff':'sf').value,q=$(kind==='films'?'fs':'ss').value.toLowerCase();return data.filter(i=>(kind==='films'?i.type==='Film':i.type==='Série')).filter(i=>(f==='all'||f==='error'&&i.status==='error'||f==='yes'&&i.status!=='error'&&i.forced_french||f==='no'&&i.status!=='error'&&!i.forced_french)&&(!q||(i.title+' '+(i.season||'')+' '+(i.episode||'')).toLowerCase().includes(q)))}
 function badge(i){return i.status==='error'?'<span class="badge err">⚠ Erreur</span>':i.forced_french?'<span class="badge yes">✅ Oui</span>':'<span class="badge no">❌ Non</span>'}
 function render(kind){const r=rows(kind),t=$(kind);const cols=kind==='series'?5:3;t.innerHTML=r.length?r.map(i=>'<tr><td>'+esc(i.title)+'</td>'+(kind==='series'?'<td>'+esc(i.season||'—')+'</td><td>'+esc(i.episode||'—')+'</td>':'')+'<td>'+badge(i)+(i.error?'<div class="small">'+esc(i.error)+'</div>':'')+'</td><td>'+(i.arr_url?'<a class="btn" target="_blank" href="'+esc(i.arr_url)+'">Ouvrir '+esc(i.arr_source)+'</a>':'—')+'</td></tr>').join(''):'<tr><td colspan="'+cols+'" class="empty">Aucun résultat correspondant.</td></tr>'}
 async function loadResults(){data=(await api('/scan/results')).results||[];render('films');render('series');loaded=true}
 ['ff','fs'].forEach(id=>$(id).oninput=()=>render('films'));['sf','ss'].forEach(id=>$(id).oninput=()=>render('series'));
 async function loadHistory(){const d=await api('/history');$('history').innerHTML=d.results.length?d.results.map(i=>'<tr><td>'+new Date(i.timestamp*1000).toLocaleString('fr-FR')+'</td><td>'+esc(i.torrent_name)+'</td><td>'+esc(i.result)+'</td><td>'+esc(i.details||'—')+'</td></tr>').join(''):'<tr><td colspan="4" class="empty">Aucune analyse depuis le démarrage.</td></tr>'}
-async function refresh(){try{const [s,x]=await Promise.all([api('/status'),api('/scan/status')]);st('qb',s.qbittorrent.status,s.qbittorrent.torrents!=null?'('+s.qbittorrent.torrents+')':'');st('discord',s.discord.status);st('radarr',s.radarr.status,s.radarr.version?'v'+s.radarr.version:'');st('sonarr',s.sonarr.status,s.sonarr.version?'v'+s.sonarr.version:'');const p=x.total_files?Math.round(x.processed_files/x.total_files*100):0;$('bar').style.width=p+'%';$('scanLabel').textContent=x.running?'Scan en cours : '+p+'%'+(x.current_file?' — '+x.current_file:''):(x.finished_at?'Dernier scan terminé.':'Aucun scan en cours.');$('stats').textContent='Analysés : '+x.processed_files+'/'+x.total_files+' • Avec FR Forced : '+x.files_with_forced_fr+' • Sans FR Forced : '+x.files_without_forced_fr+' • Erreurs : '+x.errors;if(!loaded||(prev&&!x.running))await loadResults();prev=x.running;clearTimeout(timer);timer=setTimeout(refresh,x.running?5000:15000)}catch(e){console.error(e);clearTimeout(timer);timer=setTimeout(refresh,15000)}}refresh();
+async function refresh(){try{const [s,x]=await Promise.all([api('/status'),api('/scan/status')]);st('qb',s.qbittorrent.status,s.qbittorrent.torrents!=null?'('+s.qbittorrent.torrents+')':'');st('discord',s.discord.status);st('radarr',s.radarr.status,s.radarr.version?'v'+s.radarr.version:'');st('sonarr',s.sonarr.status,s.sonarr.version?'v'+s.sonarr.version:'');const p=x.total_files?Math.round(x.processed_files/x.total_files*100):0;$('bar').style.width=p+'%';$('scanLabel').textContent=x.running?'Scan en cours : '+p+'%'+(x.current_file?' — '+x.current_file:''):(x.finished_at?'Dernier scan terminé.':'Aucun scan en cours.');$('stats').textContent='Analysés : '+x.processed_files+'/'+x.total_files+' • Avec FR Forced : '+x.files_with_forced_fr+' • Sans FR Forced : '+x.files_without_forced_fr+' • Cache : '+(x.cache_hits||0)+' • FFprobe : '+(x.reanalyzed||0)+' • Erreurs : '+x.errors;if(!loaded||(prev&&!x.running))await loadResults();prev=x.running;clearTimeout(timer);timer=setTimeout(refresh,x.running?5000:15000)}catch(e){console.error(e);clearTimeout(timer);timer=setTimeout(refresh,15000)}}refresh();
 </script></main></body></html>"""
 
 
@@ -2615,7 +2714,7 @@ def status() -> dict[str, Any]:
 
     return {
         "status": "ok",
-        "version": "2.1.0",
+        "version": "2.2.0",
         "uptime_seconds": int(time.time() - SERVICE_STARTED_AT),
         "qbittorrent": {
             "status": qb_status,
@@ -2673,15 +2772,15 @@ def scan_results() -> dict[str, Any]:
 
 
 @app.post("/scan/films")
-def scan_films() -> dict[str, Any]:
-    return start_library_scan("films")
+def scan_films(mode: str = "incremental") -> dict[str, Any]:
+    return start_library_scan("films", mode)
 
 
 @app.post("/scan/series")
-def scan_series() -> dict[str, Any]:
-    return start_library_scan("series")
+def scan_series(mode: str = "incremental") -> dict[str, Any]:
+    return start_library_scan("series", mode)
 
 
 @app.post("/scan/all")
-def scan_all() -> dict[str, Any]:
-    return start_library_scan("all")
+def scan_all(mode: str = "incremental") -> dict[str, Any]:
+    return start_library_scan("all", mode)
