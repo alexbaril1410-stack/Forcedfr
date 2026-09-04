@@ -83,7 +83,7 @@ log = logging.getLogger("forcedfr")
 app = FastAPI(
     title="ForcedFR",
     description="Détection automatique des pistes françaises forcées.",
-    version="1.4.1",
+    version="1.4.2",
 )
 
 
@@ -104,6 +104,9 @@ processing_torrents: set[str] = set()
 
 MAIN_EVENT_LOOP: asyncio.AbstractEventLoop | None = None
 discord_bot: Any = None
+
+# Évite qu'une même notification Discord soit traitée plusieurs fois.
+resolved_discord_actions: set[str] = set()
 
 
 # ============================================================
@@ -574,6 +577,46 @@ class ForcedFRView(discord.ui.View if discord else object):
         ))
 
 
+def build_disabled_decision_view(message: Any) -> Any:
+    """
+    Reconstruit les boutons après une décision.
+
+    Les liens restent actifs. Seuls les boutons interactifs
+    Continuer / Laisser en pause sont désactivés.
+    """
+    if discord is None:
+        return None
+
+    view = discord.ui.View(timeout=None)
+
+    for row in getattr(message, "components", []):
+        for component in getattr(row, "children", []):
+            custom_id = getattr(component, "custom_id", None)
+            url = getattr(component, "url", None)
+
+            disabled = bool(
+                custom_id
+                and str(custom_id).startswith("forcedfr:")
+            )
+
+            view.add_item(
+                discord.ui.Button(
+                    label=getattr(component, "label", None),
+                    style=getattr(
+                        component,
+                        "style",
+                        discord.ButtonStyle.secondary,
+                    ),
+                    custom_id=custom_id,
+                    url=url,
+                    emoji=getattr(component, "emoji", None),
+                    disabled=disabled,
+                )
+            )
+
+    return view
+
+
 def build_discord_bot() -> Any:
     if discord is None:
         return None
@@ -596,33 +639,114 @@ def build_discord_bot() -> Any:
             if not custom_id.startswith("forcedfr:"):
                 return
 
-            _, action, torrent_hash = custom_id.split(":", 2)
+            parts = custom_id.split(":", 2)
+            if len(parts) != 3:
+                return
+
+            _, action, torrent_hash = parts
+
+            await interaction.response.defer(ephemeral=True)
+
+            if torrent_hash in resolved_discord_actions:
+                await interaction.followup.send(
+                    "ℹ️ Une décision a déjà été prise pour ce torrent.",
+                    ephemeral=True,
+                )
+                return
+
+            # Vérifie que le torrent existe toujours avant toute action.
+            await asyncio.to_thread(get_torrent, torrent_hash)
 
             if action == "resume":
                 await asyncio.to_thread(start_torrent, torrent_hash)
-                message = "▶️ Téléchargement repris dans qBittorrent."
-                log.info("[%s] Reprise demandée depuis Discord par %s.", torrent_hash, interaction.user)
+                response_message = (
+                    "▶️ Le téléchargement a été repris dans qBittorrent."
+                )
+                log.info(
+                    "[%s] Reprise demandée depuis Discord par %s.",
+                    torrent_hash,
+                    interaction.user,
+                )
+
             elif action == "pause":
                 await asyncio.to_thread(stop_torrent, torrent_hash)
-                message = "⏸️ Le téléchargement reste en pause dans qBittorrent."
-                log.info("[%s] Maintien en pause demandé depuis Discord par %s.", torrent_hash, interaction.user)
+                response_message = (
+                    "⏸️ Le téléchargement reste en pause dans qBittorrent."
+                )
+                log.info(
+                    "[%s] Maintien en pause demandé depuis Discord par %s.",
+                    torrent_hash,
+                    interaction.user,
+                )
+
             else:
-                return
-
-            await interaction.response.send_message(message, ephemeral=True)
-
-        except HTTPException:
-            await interaction.response.send_message(
-                "⚠️ Ce torrent n'existe plus dans qBittorrent.",
-                ephemeral=True,
-            )
-        except Exception as exc:
-            log.exception("Erreur lors d'une interaction Discord : %s", exc)
-            if not interaction.response.is_done():
-                await interaction.response.send_message(
-                    "⚠️ Impossible d'exécuter cette action.",
+                await interaction.followup.send(
+                    "⚠️ Action Discord inconnue.",
                     ephemeral=True,
                 )
+                return
+
+            resolved_discord_actions.add(torrent_hash)
+
+            # Désactive les boutons de décision tout en conservant
+            # les liens vers torrent / qBittorrent / Radarr-Sonarr.
+            if interaction.message is not None:
+                await interaction.message.edit(
+                    view=build_disabled_decision_view(
+                        interaction.message
+                    )
+                )
+
+            await interaction.followup.send(
+                response_message,
+                ephemeral=True,
+            )
+
+            log.info(
+                "[%s] Décision Discord enregistrée : %s.",
+                torrent_hash,
+                action,
+            )
+
+        except HTTPException:
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    "⚠️ Ce torrent n'existe plus dans qBittorrent.",
+                    ephemeral=True,
+                )
+            else:
+                await interaction.followup.send(
+                    "⚠️ Ce torrent n'existe plus dans qBittorrent.",
+                    ephemeral=True,
+                )
+
+        except requests.RequestException:
+            log.exception(
+                "Erreur qBittorrent lors d'une interaction Discord."
+            )
+            await interaction.followup.send(
+                "⚠️ Impossible de communiquer avec qBittorrent.",
+                ephemeral=True,
+            )
+
+        except Exception as exc:
+            log.exception(
+                "Erreur lors d'une interaction Discord : %s",
+                exc,
+            )
+            try:
+                if not interaction.response.is_done():
+                    await interaction.response.send_message(
+                        "⚠️ Impossible d'exécuter cette action.",
+                        ephemeral=True,
+                    )
+                else:
+                    await interaction.followup.send(
+                        "⚠️ Impossible d'exécuter cette action.",
+                        ephemeral=True,
+                    )
+            except Exception:
+                pass
 
     return bot
 
@@ -1778,7 +1902,7 @@ def health() -> dict[str, Any]:
 
     return {
         "status": "ok",
-        "version": "1.4.0",
+        "version": "1.4.2",
         "qbittorrent": QB_HOST,
         "monitoring": True,
         "poll_seconds": POLL_SECONDS,
