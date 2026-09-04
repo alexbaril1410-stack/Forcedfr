@@ -83,7 +83,7 @@ log = logging.getLogger("forcedfr")
 app = FastAPI(
     title="ForcedFR",
     description="Détection automatique des pistes françaises forcées.",
-    version="1.4.2",
+    version="1.4.3",
 )
 
 
@@ -306,6 +306,80 @@ def start_torrent(
 # DISCORD / RADARR / SONARR
 # ============================================================
 
+def arr_item_url_lookup(
+    base_url: str,
+    api_key: str,
+    source: str,
+    item_id: Any,
+) -> str:
+    """
+    Construit l'URL de la page web Radarr/Sonarr.
+
+    Les IDs présents dans l'historique sont des IDs internes Arr.
+    L'interface web utilise des IDs externes :
+    - Radarr : tmdbId
+    - Sonarr : tvdbId
+
+    En cas d'échec de la requête complémentaire, on conserve
+    l'URL basée sur l'ID interne afin de ne jamais bloquer
+    la notification Discord.
+    """
+
+    if item_id is None:
+        return base_url
+
+    fallback = (
+        f"{base_url}/movie/{item_id}"
+        if source == "Radarr"
+        else f"{base_url}/series/{item_id}"
+    )
+
+    try:
+        endpoint = (
+            f"{base_url}/api/v3/movie/{item_id}"
+            if source == "Radarr"
+            else f"{base_url}/api/v3/series/{item_id}"
+        )
+
+        response = requests.get(
+            endpoint,
+            headers={"X-Api-Key": api_key},
+            timeout=10,
+        )
+        response.raise_for_status()
+
+        item = response.json()
+
+        if source == "Radarr":
+            external_id = item.get("tmdbId")
+            if external_id:
+                return f"{base_url}/movie/{external_id}"
+
+        else:
+            external_id = item.get("tvdbId")
+            if external_id and str(external_id) != "0":
+                return f"{base_url}/series/{external_id}"
+
+        log.warning(
+            "[%s] Identifiant externe introuvable pour %s ID %s. "
+            "Utilisation de l'URL de secours.",
+            source,
+            source,
+            item_id,
+        )
+
+    except Exception as exc:
+        log.warning(
+            "Impossible de récupérer l'identifiant externe %s "
+            "(ID interne %s) : %s. Utilisation de l'URL de secours.",
+            source,
+            item_id,
+            exc,
+        )
+
+    return fallback
+
+
 def arr_history_lookup(
     base_url: str,
     api_key: str,
@@ -350,12 +424,18 @@ def arr_history_lookup(
 
         data = grabbed.get("data", {}) or {}
 
-        item_id = grabbed.get("movieId") if source == "Radarr" else grabbed.get("seriesId")
+        item_id = (
+            grabbed.get("movieId")
+            if source == "Radarr"
+            else grabbed.get("seriesId")
+        )
 
-        if item_id is not None:
-            arr_item_url = f"{base_url}/movie/{item_id}" if source == "Radarr" else f"{base_url}/series/{item_id}"
-        else:
-            arr_item_url = base_url
+        arr_item_url = arr_item_url_lookup(
+            base_url,
+            api_key,
+            source,
+            item_id,
+        )
 
         return {
             "source": source,
@@ -1902,7 +1982,7 @@ def health() -> dict[str, Any]:
 
     return {
         "status": "ok",
-        "version": "1.4.2",
+        "version": "1.4.3",
         "qbittorrent": QB_HOST,
         "monitoring": True,
         "poll_seconds": POLL_SECONDS,
