@@ -3,12 +3,14 @@ import json
 import logging
 import os
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Any
 
 import requests
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse
 
 try:
     import discord
@@ -83,7 +85,7 @@ log = logging.getLogger("forcedfr")
 app = FastAPI(
     title="ForcedFR",
     description="Détection automatique des pistes françaises forcées.",
-    version="1.4.3",
+    version="2.0.0",
 )
 
 
@@ -1982,7 +1984,7 @@ def health() -> dict[str, Any]:
 
     return {
         "status": "ok",
-        "version": "1.4.3",
+        "version": "2.0.0",
         "qbittorrent": QB_HOST,
         "monitoring": True,
         "poll_seconds": POLL_SECONDS,
@@ -2128,3 +2130,377 @@ def resume(
             status_code=502,
             detail=f"Erreur qBittorrent : {exc}",
         )
+
+# ============================================================
+# V2.0 — INTERFACE WEB ET SCAN DE BIBLIOTHÈQUE
+# ============================================================
+
+LIBRARY_FILMS_PATH = Path(
+    os.getenv("LIBRARY_FILMS_PATH", "/data/Films")
+)
+
+LIBRARY_SERIES_PATH = Path(
+    os.getenv("LIBRARY_SERIES_PATH", "/data/Séries")
+)
+
+SERVICE_STARTED_AT = time.time()
+
+scan_lock = threading.Lock()
+scan_state: dict[str, Any] = {
+    "running": False,
+    "requested_scope": None,
+    "started_at": None,
+    "finished_at": None,
+    "current_file": None,
+    "total_files": 0,
+    "processed_files": 0,
+    "files_with_forced_fr": 0,
+    "files_without_forced_fr": 0,
+    "errors": 0,
+    "results": [],
+    "last_error": None,
+}
+
+
+def _scan_reset(scope: str) -> None:
+    scan_state.update(
+        {
+            "running": True,
+            "requested_scope": scope,
+            "started_at": time.time(),
+            "finished_at": None,
+            "current_file": None,
+            "total_files": 0,
+            "processed_files": 0,
+            "files_with_forced_fr": 0,
+            "files_without_forced_fr": 0,
+            "errors": 0,
+            "results": [],
+            "last_error": None,
+        }
+    )
+
+
+def _scan_roots(scope: str) -> list[Path]:
+    if scope == "films":
+        return [LIBRARY_FILMS_PATH]
+    if scope == "series":
+        return [LIBRARY_SERIES_PATH]
+    if scope == "all":
+        return [LIBRARY_FILMS_PATH, LIBRARY_SERIES_PATH]
+    raise ValueError("Scope de scan invalide.")
+
+
+def _library_kind(file_path: Path) -> str:
+    try:
+        if file_path.is_relative_to(LIBRARY_FILMS_PATH):
+            return "film"
+        if file_path.is_relative_to(LIBRARY_SERIES_PATH):
+            return "serie"
+    except AttributeError:
+        path_text = str(file_path)
+        if path_text.startswith(str(LIBRARY_FILMS_PATH)):
+            return "film"
+        if path_text.startswith(str(LIBRARY_SERIES_PATH)):
+            return "serie"
+    return "inconnu"
+
+
+def _relative_library_path(file_path: Path) -> str:
+    for root in (LIBRARY_FILMS_PATH, LIBRARY_SERIES_PATH):
+        try:
+            return str(file_path.relative_to(root))
+        except ValueError:
+            pass
+    return str(file_path)
+
+
+def run_library_scan(scope: str) -> None:
+    if not scan_lock.acquire(blocking=False):
+        log.warning("Un scan de bibliothèque est déjà en cours.")
+        return
+
+    try:
+        _scan_reset(scope)
+        roots = _scan_roots(scope)
+
+        files: list[Path] = []
+
+        for root in roots:
+            if not root.exists():
+                log.warning("Bibliothèque introuvable : %s", root)
+                continue
+
+            files.extend(
+                sorted(
+                    path
+                    for path in root.rglob("*")
+                    if path.is_file() and path.suffix.lower() == ".mkv"
+                )
+            )
+
+        scan_state["total_files"] = len(files)
+
+        log.info(
+            "[SCAN] Démarrage du scan '%s' : %d MKV détecté(s).",
+            scope,
+            len(files),
+        )
+
+        for file_path in files:
+            scan_state["current_file"] = str(file_path)
+
+            result: dict[str, Any] = {
+                "path": str(file_path),
+                "relative_path": _relative_library_path(file_path),
+                "type": _library_kind(file_path),
+                "forced_french": False,
+                "status": "ok",
+                "error": None,
+                "forced_tracks": [],
+                "subtitles": [],
+            }
+
+            try:
+                probe = run_ffprobe(file_path)
+                detection = detect_french_forced(probe)
+
+                result["forced_french"] = bool(
+                    detection.get("forced_french")
+                )
+                result["forced_tracks"] = detection.get(
+                    "forced_tracks", []
+                )
+                result["subtitles"] = detection.get(
+                    "subtitles", []
+                )
+
+                if result["forced_french"]:
+                    scan_state["files_with_forced_fr"] += 1
+                else:
+                    scan_state["files_without_forced_fr"] += 1
+                    scan_state["results"].append(result)
+
+            except Exception as exc:
+                result["status"] = "error"
+                result["error"] = str(exc)
+                scan_state["errors"] += 1
+                scan_state["results"].append(result)
+
+                log.warning(
+                    "[SCAN] Erreur sur %s : %s",
+                    file_path,
+                    exc,
+                )
+
+            finally:
+                scan_state["processed_files"] += 1
+
+        log.info(
+            "[SCAN] Terminé : %d analysé(s), %d sans FR Forced, %d erreur(s).",
+            scan_state["processed_files"],
+            scan_state["files_without_forced_fr"],
+            scan_state["errors"],
+        )
+
+    except Exception as exc:
+        scan_state["last_error"] = str(exc)
+        log.exception("[SCAN] Erreur générale.")
+
+    finally:
+        scan_state["running"] = False
+        scan_state["current_file"] = None
+        scan_state["finished_at"] = time.time()
+        scan_lock.release()
+
+
+def start_library_scan(scope: str) -> dict[str, Any]:
+    if scan_state.get("running"):
+        raise HTTPException(
+            status_code=409,
+            detail="Un scan de bibliothèque est déjà en cours.",
+        )
+
+    thread = threading.Thread(
+        target=run_library_scan,
+        args=(scope,),
+        daemon=True,
+        name=f"forcedfr-scan-{scope}",
+    )
+    thread.start()
+
+    return {
+        "ok": True,
+        "message": f"Scan '{scope}' démarré.",
+        "scope": scope,
+    }
+
+
+def _discord_status() -> str:
+    if discord_bot is None:
+        return "disabled"
+    try:
+        return "connected" if discord_bot.is_ready() else "connecting"
+    except Exception:
+        return "unknown"
+
+
+def _qbittorrent_status() -> tuple[str, int | None]:
+    try:
+        count = len(get_torrents())
+        return "connected", count
+    except Exception:
+        return "error", None
+
+
+@app.get("/", response_class=HTMLResponse)
+def web_dashboard() -> str:
+    return """<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ForcedFR v2.0</title>
+<style>
+:root{color-scheme:dark;font-family:Inter,system-ui,Arial,sans-serif}
+*{box-sizing:border-box} body{margin:0;background:#0d1117;color:#e6edf3}
+main{max-width:1180px;margin:auto;padding:28px}
+h1{margin:0;font-size:2rem}.sub{color:#8b949e;margin:6px 0 26px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px}
+.card{background:#161b22;border:1px solid #30363d;border-radius:14px;padding:18px}
+.label{color:#8b949e;font-size:.85rem}.value{font-size:1.25rem;font-weight:700;margin-top:8px}
+.ok{color:#3fb950}.warn{color:#d29922}.bad{color:#f85149}
+.actions{display:flex;flex-wrap:wrap;gap:10px;margin:24px 0}
+button{border:0;border-radius:9px;padding:12px 16px;font-weight:700;cursor:pointer;background:#238636;color:white}
+button.secondary{background:#30363d}button:hover{filter:brightness(1.12)}
+section{margin-top:24px}.progress{height:12px;background:#21262d;border-radius:999px;overflow:hidden}
+.progress>div{height:100%;background:#238636;width:0%;transition:.3s}
+table{width:100%;border-collapse:collapse;background:#161b22;border-radius:14px;overflow:hidden}
+th,td{text-align:left;padding:12px;border-bottom:1px solid #30363d;font-size:.9rem}
+.path{word-break:break-all}.small{font-size:.82rem;color:#8b949e}
+</style>
+</head>
+<body>
+<main>
+<h1>ForcedFR <span class="small">v2.0.0</span></h1>
+<p class="sub">Surveillance des torrents et contrôle de la bibliothèque média.</p>
+
+<div class="grid">
+ <div class="card"><div class="label">ForcedFR</div><div class="value ok" id="service">Chargement…</div></div>
+ <div class="card"><div class="label">qBittorrent</div><div class="value" id="qb">Chargement…</div></div>
+ <div class="card"><div class="label">Discord</div><div class="value" id="discord">Chargement…</div></div>
+ <div class="card"><div class="label">Torrents en cours d'analyse</div><div class="value" id="processing">0</div></div>
+</div>
+
+<section>
+<h2>Scanner la bibliothèque</h2>
+<div class="actions">
+<button onclick="scan('films')">🎬 Scanner les films</button>
+<button onclick="scan('series')">📺 Scanner les séries</button>
+<button class="secondary" onclick="scan('all')">🔍 Scanner toute la bibliothèque</button>
+</div>
+<div class="card">
+ <div class="label" id="scanLabel">Aucun scan en cours.</div>
+ <div class="progress"><div id="bar"></div></div>
+ <div class="small" id="scanStats" style="margin-top:10px"></div>
+</div>
+</section>
+
+<section>
+<h2>Fichiers nécessitant une vérification</h2>
+<p class="small">Les fichiers sans piste française forcée et les erreurs d'analyse apparaissent ici.</p>
+<table>
+<thead><tr><th>Type</th><th>Fichier</th><th>État</th></tr></thead>
+<tbody id="results"><tr><td colspan="3">Aucun résultat pour le moment.</td></tr></tbody>
+</table>
+</section>
+</main>
+
+<script>
+async function api(url,opt={}){const r=await fetch(url,opt);const d=await r.json();if(!r.ok)throw new Error(d.detail||'Erreur API');return d}
+async function scan(scope){try{await api('/scan/'+scope,{method:'POST'});refresh()}catch(e){alert(e.message)}}
+function esc(v){return String(v||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[c]))}
+async function refresh(){
+ try{
+  const s=await api('/status');
+  document.getElementById('service').textContent=s.status==='ok'?'● En ligne':'● Erreur';
+  document.getElementById('qb').textContent=s.qbittorrent.status==='connected'?'● Connecté ('+(s.qbittorrent.torrents||0)+')':'● Indisponible';
+  document.getElementById('discord').textContent=s.discord.status;
+  document.getElementById('processing').textContent=s.monitoring.processing_torrents;
+  const x=await api('/scan/status');
+  const pct=x.total_files?Math.round((x.processed_files/x.total_files)*100):0;
+  document.getElementById('bar').style.width=pct+'%';
+  document.getElementById('scanLabel').textContent=x.running?('Scan en cours : '+pct+'%'+(x.current_file?' — '+x.current_file:'' )):(x.finished_at?'Dernier scan terminé.':'Aucun scan en cours.');
+  document.getElementById('scanStats').textContent='Analysés : '+x.processed_files+'/'+x.total_files+' • Avec FR Forced : '+x.files_with_forced_fr+' • Sans FR Forced : '+x.files_without_forced_fr+' • Erreurs : '+x.errors;
+  const r=await api('/scan/results');
+  const rows=r.results||[];
+  document.getElementById('results').innerHTML=rows.length?rows.map(a=>'<tr><td>'+esc(a.type)+'</td><td class="path">'+esc(a.relative_path)+'</td><td class="'+(a.status==='error'?'bad':'warn')+'">'+(a.status==='error'?'Erreur : '+esc(a.error):'Pas de FR Forced')+'</td></tr>').join(''):'<tr><td colspan="3">Aucun fichier problématique détecté.</td></tr>';
+ }catch(e){console.error(e)}
+}
+refresh();setInterval(refresh,3000);
+</script>
+</body></html>"""
+
+
+@app.get("/status")
+def status() -> dict[str, Any]:
+    qb_status, qb_count = _qbittorrent_status()
+
+    return {
+        "status": "ok",
+        "version": "2.0.0",
+        "uptime_seconds": int(time.time() - SERVICE_STARTED_AT),
+        "qbittorrent": {
+            "status": qb_status,
+            "host": QB_HOST,
+            "torrents": qb_count,
+        },
+        "discord": {
+            "status": _discord_status(),
+            "channel_id": DISCORD_CHANNEL_ID or None,
+        },
+        "monitoring": {
+            "enabled": True,
+            "poll_seconds": POLL_SECONDS,
+            "known_torrents": len(previous_torrents),
+            "processing_torrents": len(processing_torrents),
+        },
+        "scan": {
+            "running": scan_state.get("running", False),
+            "scope": scan_state.get("requested_scope"),
+            "processed_files": scan_state.get("processed_files", 0),
+            "total_files": scan_state.get("total_files", 0),
+        },
+        "libraries": {
+            "films": str(LIBRARY_FILMS_PATH),
+            "series": str(LIBRARY_SERIES_PATH),
+        },
+    }
+
+
+@app.get("/scan/status")
+def scan_status() -> dict[str, Any]:
+    return dict(scan_state)
+
+
+@app.get("/scan/results")
+def scan_results() -> dict[str, Any]:
+    return {
+        "running": scan_state.get("running", False),
+        "results": list(scan_state.get("results", [])),
+    }
+
+
+@app.post("/scan/films")
+def scan_films() -> dict[str, Any]:
+    return start_library_scan("films")
+
+
+@app.post("/scan/series")
+def scan_series() -> dict[str, Any]:
+    return start_library_scan("series")
+
+
+@app.post("/scan/all")
+def scan_all() -> dict[str, Any]:
+    return start_library_scan("all")
