@@ -94,7 +94,7 @@ log = logging.getLogger("forcedfr")
 app = FastAPI(
     title="ForcedFR",
     description="Détection automatique des pistes françaises forcées.",
-    version="2.3.0",
+    version="2.3.1",
 )
 
 
@@ -921,6 +921,8 @@ def notify_no_french_forced(
         )
         return
 
+    update_torrent_release_context(torrent_hash, release)
+
     fields = build_release_fields(
         torrent,
         release,
@@ -989,6 +991,8 @@ def notify_analysis_error(
             torrent_hash,
         )
         return
+
+    update_torrent_release_context(torrent_hash, release)
 
     fields = build_release_fields(
         torrent,
@@ -1653,6 +1657,12 @@ def process_new_torrent(
                     "no_forced",
                     "Aucune piste FR Forced détectée. Torrent mis en pause.",
                 )
+                record_torrent_action(
+                    torrent_hash,
+                    "auto_pause",
+                    source="forcedfr",
+                    details="Torrent mis en pause automatiquement après analyse sans piste FR Forced.",
+                )
 
                 notify_no_french_forced(
                     torrent
@@ -2236,9 +2246,21 @@ def init_database() -> None:
                 analyzed_at REAL NOT NULL,
                 updated_at REAL NOT NULL,
                 last_action TEXT,
-                last_action_at REAL
+                last_action_at REAL,
+                tracker_url TEXT,
+                arr_url TEXT,
+                arr_source TEXT
             )
         """)
+        # Migration automatique des bases créées avant la v2.3.1.
+        existing_columns = {row["name"] for row in conn.execute("PRAGMA table_info(torrent_analysis)").fetchall()}
+        for column, definition in (
+            ("tracker_url", "TEXT"),
+            ("arr_url", "TEXT"),
+            ("arr_source", "TEXT"),
+        ):
+            if column not in existing_columns:
+                conn.execute(f"ALTER TABLE torrent_analysis ADD COLUMN {column} {definition}")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_torrent_analysis_analyzed_at ON torrent_analysis(analyzed_at DESC)")
 
         conn.execute("""
@@ -2371,18 +2393,66 @@ def record_torrent_action(
         """, (action, now, now, torrent_hash))
 
 
+def update_torrent_release_context(
+    torrent_hash: str,
+    release: dict[str, Any] | None,
+) -> None:
+    if not release:
+        return
+    with _db_connect() as conn:
+        conn.execute(
+            """
+            UPDATE torrent_analysis
+            SET tracker_url=COALESCE(?, tracker_url),
+                arr_url=COALESCE(?, arr_url),
+                arr_source=COALESCE(?, arr_source),
+                updated_at=?
+            WHERE torrent_hash=?
+            """,
+            (
+                release.get("tracker_url"),
+                release.get("arr_item_url"),
+                release.get("source"),
+                time.time(),
+                torrent_hash,
+            ),
+        )
+
+
+def _resolve_missing_history_context(item: dict[str, Any]) -> dict[str, Any]:
+    # Les anciennes analyses v2.3.0 ne possèdent pas encore les URLs.
+    # On les récupère une seule fois depuis Radarr/Sonarr puis on les mémorise.
+    if item.get("tracker_url") and item.get("arr_url"):
+        return item
+    release = get_release_context(str(item.get("torrent_hash", "")))
+    if release.get("source") or release.get("tracker_url") or release.get("arr_item_url"):
+        update_torrent_release_context(str(item.get("torrent_hash", "")), release)
+        item["tracker_url"] = release.get("tracker_url") or item.get("tracker_url")
+        item["arr_url"] = release.get("arr_item_url") or item.get("arr_url")
+        item["arr_source"] = release.get("source") or item.get("arr_source")
+    return item
+
+
 def get_analysis_history(limit: int | None = None) -> list[dict[str, Any]]:
     history_limit = max(1, min(int(limit or ANALYSIS_HISTORY_LIMIT), 5000))
     with _db_connect() as conn:
         rows = conn.execute("""
             SELECT torrent_hash, torrent_name, result, details,
                    analyzed_at AS timestamp, forced_french,
-                   last_action, last_action_at
+                   last_action, last_action_at,
+                   tracker_url, arr_url, arr_source
             FROM torrent_analysis
             ORDER BY analyzed_at DESC
             LIMIT ?
         """, (history_limit,)).fetchall()
-    return [dict(row) for row in rows]
+    results = [dict(row) for row in rows]
+    # Pour les anciennes entrées sans URLs, on enrichit progressivement
+    # les plus récentes afin de ne pas ralentir l'ouverture de l'historique.
+    for index, item in enumerate(results):
+        if index >= 50:
+            break
+        _resolve_missing_history_context(item)
+    return results
 
 
 scan_lock = threading.Lock()
@@ -2749,7 +2819,7 @@ def _qbittorrent_status() -> tuple[str, int | None]:
 def web_dashboard() -> str:
     return """<!doctype html>
 <html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ForcedFR v2.3.0</title>
+<title>ForcedFR v2.3.1</title>
 <style>
 :root{color-scheme:dark;--bg:#0d1117;--p:#161b22;--b:#30363d;--m:#8b949e;--t:#e6edf3;--g:#3fb950;--y:#d29922;--r:#f85149;font-family:Inter,system-ui,sans-serif}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--t)}main{max-width:1320px;margin:auto;padding:28px}h1{margin:0}.sub,.small{color:var(--m)}
@@ -2760,10 +2830,10 @@ def web_dashboard() -> str:
 .panel{display:none}.panel.active{display:block}.progress{height:11px;background:#21262d;border-radius:999px;overflow:hidden;margin-top:10px}.progress div{height:100%;width:0;background:#238636;transition:.3s}
 select,input{background:#0f141b;color:white;border:1px solid var(--b);border-radius:8px;padding:9px}input{min-width:220px;flex:1}
 .tablewrap{padding:0;overflow:auto}table{width:100%;border-collapse:collapse;min-width:650px}th,td{padding:12px;text-align:left;border-bottom:1px solid var(--b)}th{color:var(--m);font-size:.78rem;text-transform:uppercase}
-.badge{font-weight:700}.yes{color:var(--g)}.no{color:var(--r)}.err{color:var(--y)}a.btn{background:#1f6feb;color:white;text-decoration:none;padding:7px 10px;border-radius:7px;font-size:.82rem}
+.badge{font-weight:700}.yes{color:var(--g)}.no{color:var(--r)}.err{color:var(--y)}a.btn{display:inline-block;background:#1f6feb;color:white;text-decoration:none;padding:7px 10px;border-radius:7px;font-size:.82rem;margin:2px 4px 2px 0;white-space:nowrap}
 .empty{color:var(--m);text-align:center;padding:22px}@media(max-width:700px){main{padding:16px}}
 </style></head><body><main>
-<h1>ForcedFR <span class="small">v2.3.0</span></h1><p class="sub">Surveillance qBittorrent et contrôle des bibliothèques Radarr / Sonarr.</p>
+<h1>ForcedFR <span class="small">v2.3.1</span></h1><p class="sub">Surveillance qBittorrent et contrôle des bibliothèques Radarr / Sonarr.</p>
 <div class="grid">
 <div class="card"><div class="label">ForcedFR</div><div class="value ok">● En ligne</div></div>
 <div class="card"><div class="label">qBittorrent</div><div class="value" id="qb">…</div></div>
@@ -2786,7 +2856,7 @@ select,input{background:#0f141b;color:white;border:1px solid var(--b);border-rad
 </section>
 
 <section id="p-history" class="panel"><h2>Historique des analyses</h2><p class="sub">Historique persistant des analyses et décisions prises sur les téléchargements.</p>
-<div class="tablewrap"><table><thead><tr><th>Date</th><th>Torrent</th><th>Résultat</th><th>Détails</th></tr></thead><tbody id="history"></tbody></table></div></section>
+<div class="tablewrap"><table><thead><tr><th>Date</th><th>Torrent</th><th>Résultat</th><th>Décision</th><th>Action</th></tr></thead><tbody id="history"></tbody></table></div></section>
 
 <script>
 const $=x=>document.getElementById(x);let data=[],prev=false,loaded=false,timer;
@@ -2801,7 +2871,9 @@ function badge(i){return i.status==='error'?'<span class="badge err">⚠ Erreur<
 function render(kind){const r=rows(kind),t=$(kind);const cols=kind==='series'?5:3;t.innerHTML=r.length?r.map(i=>'<tr><td>'+esc(i.title)+'</td>'+(kind==='series'?'<td>'+esc(i.season||'—')+'</td><td>'+esc(i.episode||'—')+'</td>':'')+'<td>'+badge(i)+(i.error?'<div class="small">'+esc(i.error)+'</div>':'')+'</td><td>'+(i.arr_url?'<a class="btn" target="_blank" href="'+esc(i.arr_url)+'">Ouvrir '+esc(i.arr_source)+'</a>':'—')+'</td></tr>').join(''):'<tr><td colspan="'+cols+'" class="empty">Aucun résultat correspondant.</td></tr>'}
 async function loadResults(){data=(await api('/scan/results')).results||[];render('films');render('series');loaded=true}
 ['ff','fs'].forEach(id=>$(id).oninput=()=>render('films'));['sf','ss'].forEach(id=>$(id).oninput=()=>render('series'));
-async function loadHistory(){const d=await api('/history');$('history').innerHTML=d.results.length?d.results.map(i=>'<tr><td>'+new Date(i.timestamp*1000).toLocaleString('fr-FR')+'</td><td>'+esc(i.torrent_name)+'</td><td>'+esc(i.result)+'</td><td>'+esc(i.details||'—')+'</td></tr>').join(''):'<tr><td colspan="4" class="empty">Aucune analyse enregistrée.</td></tr>'}
+function historyResult(i){const m={forced_found:'<span class="badge yes">✅ Forced FR détecté</span>',no_forced:'<span class="badge no">❌ Pas de Forced FR</span>',error:'<span class="badge err">⚠ Erreur d’analyse</span>'};return m[i.result]||'<span class="badge">'+esc(i.result||'—')+'</span>'}
+function historyDecision(i){const m={auto_pause:'<span class="badge no">⏸ Pause automatique</span>',pause:'<span class="badge no">⏸ Maintenu en pause</span>',resume:'<span class="badge yes">▶ Téléchargement repris</span>'};if(m[i.last_action])return m[i.last_action];if(i.result==='no_forced')return '<span class="badge no">⏸ Pause automatique</span>';return '—'}
+async function loadHistory(){const d=await api('/history');$('history').innerHTML=d.results.length?d.results.map(i=>{const actions=[];if(i.tracker_url)actions.push('<a class="btn" target="_blank" href="'+esc(i.tracker_url)+'">Voir le torrent</a>');if(i.qb_url)actions.push('<a class="btn" target="_blank" href="'+esc(i.qb_url)+'">qBittorrent</a>');if(i.arr_url)actions.push('<a class="btn" target="_blank" href="'+esc(i.arr_url)+'">'+esc(i.arr_source==='Sonarr'?'Sonarr':'Radarr')+'</a>');return '<tr><td>'+new Date(i.timestamp*1000).toLocaleString('fr-FR',{dateStyle:'short',timeStyle:'short'})+'</td><td title="'+esc(i.torrent_name)+'">'+esc(i.torrent_name)+'</td><td>'+historyResult(i)+'</td><td>'+historyDecision(i)+'</td><td>'+actions.join(' ')+'</td></tr>'}).join(''):'<tr><td colspan="5" class="empty">Aucune analyse enregistrée.</td></tr>'}
 async function refresh(){try{const [s,x]=await Promise.all([api('/status'),api('/scan/status')]);st('qb',s.qbittorrent.status,s.qbittorrent.torrents!=null?'('+s.qbittorrent.torrents+')':'');st('discord',s.discord.status);st('radarr',s.radarr.status,s.radarr.version?'v'+s.radarr.version:'');st('sonarr',s.sonarr.status,s.sonarr.version?'v'+s.sonarr.version:'');const p=x.total_files?Math.round(x.processed_files/x.total_files*100):0;$('bar').style.width=p+'%';$('scanLabel').textContent=x.running?'Scan en cours : '+p+'%'+(x.current_file?' — '+x.current_file:''):(x.finished_at?'Dernier scan terminé.':'Aucun scan en cours.');$('stats').textContent='Analysés : '+x.processed_files+'/'+x.total_files+' • Avec FR Forced : '+x.files_with_forced_fr+' • Sans FR Forced : '+x.files_without_forced_fr+' • Cache : '+(x.cache_hits||0)+' • FFprobe : '+(x.reanalyzed||0)+' • Erreurs : '+x.errors;if(!loaded||(prev&&!x.running))await loadResults();prev=x.running;clearTimeout(timer);timer=setTimeout(refresh,x.running?5000:15000)}catch(e){console.error(e);clearTimeout(timer);timer=setTimeout(refresh,15000)}}refresh();
 </script></main></body></html>"""
 
@@ -2814,7 +2886,7 @@ def status() -> dict[str, Any]:
 
     return {
         "status": "ok",
-        "version": "2.2.0",
+        "version": "2.3.1",
         "uptime_seconds": int(time.time() - SERVICE_STARTED_AT),
         "qbittorrent": {
             "status": qb_status,
@@ -2851,8 +2923,11 @@ def status() -> dict[str, Any]:
 
 @app.get("/history")
 def history() -> dict[str, Any]:
+    results = get_analysis_history()
+    for item in results:
+        item["qb_url"] = build_qbittorrent_url(str(item.get("torrent_hash", "")))
     return {
-        "results": get_analysis_history(),
+        "results": results,
         "persistent": True,
         "storage": "sqlite",
     }
