@@ -2,16 +2,19 @@ name: Build and publish Docker image
 
 on:
   push:
-    branches: [main]
-  workflow_dispatch:  # permet de le relancer manuellement depuis l'onglet Actions
+    branches:
+      - main
+      - v2.0
+  workflow_dispatch:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}  # devient ex: ghcr.io/tonpseudo/forcedfr
+  IMAGE_NAME: ${{ github.repository }}
 
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
+
     permissions:
       contents: read
       packages: write
@@ -25,13 +28,20 @@ jobs:
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}  # fourni automatiquement, rien à configurer
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Définition des tags Docker
+        id: tags
+        run: |
+          if [ "${{ github.ref_name }}" = "main" ]; then
+            echo "tags=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest,${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}" >> $GITHUB_OUTPUT
+          else
+            echo "tags=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:v2-dev,${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:v2-${{ github.sha }}" >> $GITHUB_OUTPUT
+          fi
 
       - name: Build et push de l'image
         uses: docker/build-push-action@v5
         with:
           context: .
           push: true
-          tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          tags: ${{ steps.tags.outputs.tags }}
